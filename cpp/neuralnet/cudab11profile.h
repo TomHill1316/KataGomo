@@ -4,29 +4,96 @@
 // Pure dispatch predicates. Deliberately independent of CUDA headers/runtime so
 // the profile and synthetic device cases can be tested on CPU-only machines.
 #include "desc.h"
+#include <algorithm>
 #include <climits>
 #include <cstddef>
 #include <cstring>
 #include <vector>
 
-// Structural profile, independent of checkpoint name and weight values. Do not
-// inspect weight-vector sizes: callers may retain the descriptor after releasing
-// its weights. The model loader remains responsible for validating disk data.
-inline bool isOfficialB11C768(const ModelDesc& d) {
+// ---------------------------------------------------------------------------
+// Shape-specialized transformer profiles.
+//
+// Every kernel of the RTX5090 specialization is compiled for one concrete
+// geometry. Two geometries are recognized. Both share model version 17,
+// 22/19 input channels, no meta encoder, sequence 361 (19x19), head dim 32,
+// learned RoPE, SwiGLU FFN, and the 6-nested-block (3 attention + 3 FFN)
+// nested bottleneck layout:
+//
+//   * tf3-b11c768     : 11 blocks, trunk 768, inner 384, FFN 384->1152->384, H12
+//   * b15 ffn-pruned  : 15 blocks, trunk1024, inner 512, H16 D32, and an FFN
+//                       512->w->512 whose hidden width w is pruned *per block*:
+//                       45 distinct widths from 16 to 1160, each a multiple of 8.
+//
+// The b15 case is why the FFN width is stored as an envelope plus a uniformity
+// flag rather than as a single constant. The attention, trunk and inner
+// projections are uniform; only the FFN hidden width varies, and the GEMM
+// dispatch is width-generic (CUTLASS validates alignment itself), so no extra
+// kernel instantiation is needed per width.
+//
+// Kernels are instantiated once per geometry (see the dispatch tables in
+// cudab11gemm.cu / cudab11kernels.cuh / cudab11qkvrope.cu / cudab11affine.cuh
+// / cudab11ffn.cu). Anything outside those two geometries falls back to the
+// original generic backend; there is no partial activation.
+//
+// Do not inspect weight-vector sizes: callers may retain the descriptor after
+// releasing its weights. The model loader remains responsible for validating
+// disk data.
+// ---------------------------------------------------------------------------
+struct B11SpecProfile {
+  int trunkChannels = 0;
+  int midChannels = 0;
+  int numHeads = 0;
+  int numKVHeads = 0;
+  int headDim = 0;
+  int numBlocks = 0;
+  // FFN hidden-width envelope over every FFN block in the model.
+  int ffnMinChannels = 0;
+  int ffnMaxChannels = 0;
+  bool ffnUniform = false;
+
+  bool valid() const { return trunkChannels > 0 && midChannels > 0 && ffnMaxChannels > 0; }
+  // Combined packed QKV row width: q|k|v concatenated per input channel.
+  int qkvN() const { return 3 * midChannels; }
+  // Number of (x,y) frequency pairs in the learned-RoPE table.
+  int ropePairs() const { return numKVHeads * (headDim / 2); }
+  // The single FFN width when the model uses one everywhere, else 0.
+  int ffnChannels() const { return ffnUniform ? ffnMaxChannels : 0; }
+  // True when a launch-time FFN width belongs to this profile.
+  bool acceptsFfnWidth(int channels) const {
+    return channels >= ffnMinChannels && channels <= ffnMaxChannels && (channels % 8) == 0;
+  }
+};
+
+namespace b11profile_detail {
+struct SpecExpectation {
+  int trunkChannels, midChannels, numBlocks;
+  int numHeads, numKVHeads, headDim, ropeNumPairs;
+  // 0 accepts any 8-aligned per-block FFN hidden width (b15 ffn-pruned).
+  int uniformFfnChannels;
+};
+
+// Walks the descriptor and reports the FFN envelope through ffnMin/ffnMax/
+// ffnUniform. Returns false on the first structural mismatch.
+inline bool matchesSpecGeometry(const ModelDesc& d, const SpecExpectation& e,
+  int& ffnMin, int& ffnMax, bool& ffnUniform) {
+  ffnMin = INT_MAX;
+  ffnMax = 0;
+  ffnUniform = true;
   if(d.modelVersion != 17 || d.numInputChannels != 22 || d.numInputGlobalChannels != 19 ||
-     d.numInputMetaChannels != 0 || d.trunk.trunkNumChannels != 768 ||
-     d.trunk.blocks.size() != 11 || d.trunk.numBlocks != 11)
+     d.numInputMetaChannels != 0 || d.trunk.trunkNumChannels != e.trunkChannels ||
+     (int)d.trunk.blocks.size() != e.numBlocks || d.trunk.numBlocks != e.numBlocks)
     return false;
   const auto pointwise = [](const ConvLayerDesc& c) {
     return c.convXSize == 1 && c.convYSize == 1 && c.dilationX == 1 && c.dilationY == 1;
   };
+  int ffnSeen = 0;
   for(const auto& outer : d.trunk.blocks) {
     if(outer.first != NESTED_BOTTLENECK_BLOCK_KIND || outer.second == nullptr) return false;
     const auto& n = *static_cast<const NestedBottleneckResidualBlockDesc*>(outer.second.get());
     if(n.numBlocks != 6 || n.blocks.size() != 6 ||
-       n.preBN.numChannels != 768 || n.postBN.numChannels != 384 ||
-       n.preConv.inChannels != 768 || n.preConv.outChannels != 384 ||
-       n.postConv.inChannels != 384 || n.postConv.outChannels != 768 ||
+       n.preBN.numChannels != e.trunkChannels || n.postBN.numChannels != e.midChannels ||
+       n.preConv.inChannels != e.trunkChannels || n.preConv.outChannels != e.midChannels ||
+       n.postConv.inChannels != e.midChannels || n.postConv.outChannels != e.trunkChannels ||
        !pointwise(n.preConv) || !pointwise(n.postConv)) return false;
     for(std::size_t i = 0; i < n.blocks.size(); i++) {
       const auto& item = n.blocks[i];
@@ -34,26 +101,96 @@ inline bool isOfficialB11C768(const ModelDesc& d) {
       if(i % 2 == 0) {
         if(item.first != TRANSFORMER_ATTENTION_BLOCK_KIND) return false;
         const auto& a = *static_cast<const TransformerAttentionDesc*>(item.second.get());
-        if(a.numHeads != 12 || a.numKVHeads != 12 || a.qHeadDim != 32 || a.vHeadDim != 32 ||
-           !a.useRope || !a.learnableRope || a.ropeNumKVHeads != 12 || a.ropeNumPairs != 16 ||
-           a.preLN.numChannels != 384 ||
-           a.qProj.inChannels != 384 || a.qProj.outChannels != 384 ||
-           a.kProj.inChannels != 384 || a.kProj.outChannels != 384 ||
-           a.vProj.inChannels != 384 || a.vProj.outChannels != 384 ||
-           a.outProj.inChannels != 384 || a.outProj.outChannels != 384) return false;
+        if(a.numHeads != e.numHeads || a.numKVHeads != e.numKVHeads ||
+           a.qHeadDim != e.headDim || a.vHeadDim != e.headDim ||
+           !a.useRope || !a.learnableRope ||
+           a.ropeNumKVHeads != e.numKVHeads || a.ropeNumPairs != e.ropeNumPairs ||
+           a.preLN.numChannels != e.midChannels ||
+           a.qProj.inChannels != e.midChannels || a.qProj.outChannels != e.midChannels ||
+           a.kProj.inChannels != e.midChannels || a.kProj.outChannels != e.midChannels ||
+           a.vProj.inChannels != e.midChannels || a.vProj.outChannels != e.midChannels ||
+           a.outProj.inChannels != e.midChannels || a.outProj.outChannels != e.midChannels) return false;
       }
       else {
         if(item.first != TRANSFORMER_FFN_BLOCK_KIND) return false;
         const auto& f = *static_cast<const TransformerFFNDesc*>(item.second.get());
-        if(f.numChannels != 384 || f.ffnChannels != 1152 || !f.useSwiGLU ||
-           f.preLN.numChannels != 384 ||
-           f.linear1.inChannels != 384 || f.linear1.outChannels != 1152 ||
-           f.linearGate.inChannels != 384 || f.linearGate.outChannels != 1152 ||
-           f.linear2.inChannels != 1152 || f.linear2.outChannels != 384) return false;
+        // Every specialized GEMM requires CUTLASS's 8-half operand alignment, so
+        // a hidden width that is not a multiple of 8 cannot be specialized.
+        if(f.ffnChannels <= 0 || (f.ffnChannels % 8) != 0) return false;
+        if(e.uniformFfnChannels != 0 && f.ffnChannels != e.uniformFfnChannels) return false;
+        if(f.numChannels != e.midChannels || !f.useSwiGLU ||
+           f.preLN.numChannels != e.midChannels ||
+           f.linear1.inChannels != e.midChannels || f.linear1.outChannels != f.ffnChannels ||
+           f.linearGate.inChannels != e.midChannels || f.linearGate.outChannels != f.ffnChannels ||
+           f.linear2.inChannels != f.ffnChannels || f.linear2.outChannels != e.midChannels) return false;
+        ffnMin = std::min(ffnMin, f.ffnChannels);
+        ffnMax = std::max(ffnMax, f.ffnChannels);
+        ffnSeen++;
       }
     }
   }
+  if(ffnSeen == 0) return false;
+  ffnUniform = (ffnMin == ffnMax);
   return true;
+}
+} // namespace b11profile_detail
+
+inline B11SpecProfile detectB11SpecProfile(const ModelDesc& d) {
+  static constexpr b11profile_detail::SpecExpectation kProfiles[] = {
+    // tf3-b11c768      : trunk 768, inner 384, uniform FFN 384->1152->384, H12 D32, 11 blocks
+    {768, 384, 11, 12, 12, 32, 16, 1152},
+    // b15 ffn-pruned   : trunk1024, inner 512, per-block pruned FFN 512->w->512, H16 D32, 15 blocks
+    {1024, 512, 15, 16, 16, 32, 16, 0},
+  };
+  for(const auto& e : kProfiles) {
+    int ffnMin = 0;
+    int ffnMax = 0;
+    bool ffnUniform = false;
+    if(!b11profile_detail::matchesSpecGeometry(d, e, ffnMin, ffnMax, ffnUniform))
+      continue;
+    B11SpecProfile profile;
+    profile.trunkChannels = e.trunkChannels;
+    profile.midChannels = e.midChannels;
+    profile.numHeads = e.numHeads;
+    profile.numKVHeads = e.numKVHeads;
+    profile.headDim = e.headDim;
+    profile.numBlocks = e.numBlocks;
+    profile.ffnMinChannels = ffnMin;
+    profile.ffnMaxChannels = ffnMax;
+    profile.ffnUniform = ffnUniform;
+    return profile;
+  }
+  return B11SpecProfile{};
+}
+
+// Kernels are instantiated only for the geometries listed above. This is a
+// second, cheap guard so that adding a profile above without adding the matching
+// kernel instantiations fails closed instead of launching a wrong-geometry kernel.
+// It mirrors the dispatch tables verbatim:
+//   GEMM   (N,K): trunk/mid/inner/FFN projections, any 8-aligned width
+//   norm         : 384 (mixed-width), 512 and 1024 (multiple-of-256 wide)
+//   affine       : 384, 512, 768, 1024
+//   QKV-RoPE     : 384, 512
+//   FA4 AOT      : packed QKV row 1152 (H12) or 1536 (H16), head dim 32
+inline bool isB11SpecGeometryInstanced(const B11SpecProfile& p) {
+  if(!p.valid() || p.headDim != 32) return false;
+  // Every projection is square in the head dimension, so the packed QKV row is
+  // exactly three times the inner width.
+  if(p.numHeads * p.headDim != p.midChannels) return false;
+  if(p.numKVHeads * p.headDim != p.midChannels) return false;
+  if(p.qkvN() != 3 * p.midChannels) return false;
+  if(p.ffnMinChannels <= 0 || p.ffnMaxChannels < p.ffnMinChannels) return false;
+  if((p.ffnMinChannels % 8) != 0 || (p.ffnMaxChannels % 8) != 0) return false;
+  if(p.numBlocks == 11 && p.trunkChannels == 768 && p.midChannels == 384)
+    return p.ffnUniform && p.ffnMaxChannels == 1152;
+  if(p.numBlocks == 15 && p.trunkChannels == 1024 && p.midChannels == 512)
+    return p.ffnMaxChannels <= 4096;
+  return false;
+}
+
+// Structural profile, independent of checkpoint name and weight values.
+inline bool isOfficialB11C768(const ModelDesc& d) {
+  return detectB11SpecProfile(d).trunkChannels == 768;
 }
 
 inline bool isB11CudaHardwareLayoutEligible(const char* deviceName, int major, int minor,
@@ -90,12 +227,26 @@ inline bool isB11OptimizedBatch(int batch) {
   return isB11SupportedBatch(batch,supported);
 }
 
+// Widths with an instantiated B11 RMSNorm kernel (see launchB11RmsNorm).
+inline bool isB11RmsNormWidth(int channels) {
+  return channels == 384 || channels == 512 || channels == 1024;
+}
+
+// Widths with an instantiated B11 flat affine+SiLU kernel.
+inline bool isB11AffineWidth(int channels) {
+  return channels == 384 || channels == 512 || channels == 768 || channels == 1024;
+}
+
 // A prepared handle still has to reject a partial batch at every FFN launch.
 // Do not switch its packed weight layout: fallback uses the original fused FFN.
+// The FFN hidden width is checked against the profile envelope, since b15
+// prunes it per block and therefore has no single value to compare against.
 inline bool isB11TanhFFNLaunchEligible(bool prepared,int actualBatch,int capacity,
-  int nnXLen,int nnYLen,int channels,int ffnChannels,bool useFP16,bool useNHWC) {
-  return prepared && isB11OptimizedBatch(capacity) && actualBatch == capacity &&
-    nnXLen == 19 && nnYLen == 19 && channels == 384 && ffnChannels == 1152 &&
+  int nnXLen,int nnYLen,int channels,int ffnChannels,const B11SpecProfile& profile,
+  bool useFP16,bool useNHWC) {
+  return prepared && profile.valid() && isB11OptimizedBatch(capacity) &&
+    actualBatch == capacity && nnXLen == 19 && nnYLen == 19 &&
+    channels == profile.midChannels && profile.acceptsFfnWidth(ffnChannels) &&
     useFP16 && useNHWC;
 }
 

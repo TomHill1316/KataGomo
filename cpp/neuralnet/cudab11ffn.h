@@ -14,7 +14,9 @@ namespace CudaB11FFN {
   bool supportsShape(int N, int K);
 
   // FP16 tensor-core GEMM and FP16 tanh-based SwiGLU; inputs and output use the
-  // same layout/alignment as CudaFusedFFN. N1152/K384, M361*(13 or 16) only.
+  // same layout/alignment as CudaFusedFFN. N is the FFN hidden width and K the
+  // inner width; both must be multiples of 8 and at most 4096 (b11c768 uses a
+  // single hidden width, b15 prunes it per block). M is 361*(13 or 16) only.
   // Caller must pass the full model/device/layout/profile and actual-batch gates
   // and have prepared successfully. No setup or fallback inside a hot launch.
   void runSwiGLU(const half* A, const half* w1, const half* wGate, half* output,

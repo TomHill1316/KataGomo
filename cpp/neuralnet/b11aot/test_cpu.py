@@ -34,7 +34,8 @@ class CpuTests(unittest.TestCase):
 
     def test_safe_bridge(self):
         for mode in ("exact","mask"):
-            api,bridge=render_bridge(SimpleNamespace(symbol_prefix="test",mode=mode,max_batch=96))
+            api,bridge=render_bridge(SimpleNamespace(symbol_prefix="test",mode=mode,max_batch=96,
+                heads=12,head_dim=32,sequence=361))
             self.assertIn("test_prepare",api)
             self.assertIn("CurrentDeviceLoader",bridge)
             self.assertNotIn("Kernel_Module_Load(",bridge)

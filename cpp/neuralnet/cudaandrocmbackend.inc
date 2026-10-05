@@ -538,7 +538,9 @@ struct B11PersistingL2 {
 
   int device = -1;
   int batch = 0;
-  int mode = 0; // bit 1: outer C768, bit 2: inner C384
+  int mode = 0; // bit 1: outer trunk, bit 2: inner mid
+  int trunkChannels = 0;
+  int midChannels = 0;
   size_t trunkBytes = 0;
   size_t innerBytes = 0;
   float hitRatio = 0.0f;
@@ -551,13 +553,17 @@ struct B11PersistingL2 {
   B11PersistingL2(const B11PersistingL2&) = delete;
   B11PersistingL2& operator=(const B11PersistingL2&) = delete;
 
-  void configure(int device_, int batch_, int mode_, int streams, double ratio, const void* owner, Logger* logger) {
+  void configure(int device_, int batch_, int mode_, int streams, double ratio, const void* owner, Logger* logger,
+    int trunkChannels_, int midChannels_) {
     testAssert(!leased && mode_ >= 1 && mode_ <= 3 && batch_ > 0 && streams > 0 && ratio > 0.0 && ratio <= 1.0);
+    testAssert(trunkChannels_ > 0 && midChannels_ > 0 && trunkChannels_ != midChannels_);
     int maxPersisting = 0, maxWindow = 0;
     CUDA_ERR("B11 L2",cudaDeviceGetAttribute(&maxPersisting,cudaDevAttrMaxPersistingL2CacheSize,device_));
     CUDA_ERR("B11 L2",cudaDeviceGetAttribute(&maxWindow,cudaDevAttrMaxAccessPolicyWindowSize,device_));
-    const size_t outer = (mode_ & 1) ? (size_t)batch_ * 361 * 768 * sizeof(half) : 0;
-    const size_t inner = (mode_ & 2) ? (size_t)batch_ * 361 * 384 * sizeof(half) : 0;
+    // Window sizes come from the detected profile: 768/384 for b11c768,
+    // 1024/512 for b15 ffn-pruned.
+    const size_t outer = (mode_ & 1) ? (size_t)batch_ * 361 * (size_t)trunkChannels_ * sizeof(half) : 0;
+    const size_t inner = (mode_ & 2) ? (size_t)batch_ * 361 * (size_t)midChannels_ * sizeof(half) : 0;
     if(maxPersisting <= 0 || outer > (size_t)maxWindow || inner > (size_t)maxWindow)
       return;
     const size_t total = (size_t)streams * (outer + inner);
@@ -607,6 +613,8 @@ struct B11PersistingL2 {
     }
     batch = batch_;
     mode = mode_;
+    trunkChannels = trunkChannels_;
+    midChannels = midChannels_;
     trunkBytes = outer;
     innerBytes = inner;
     hitRatio = (float)std::min(ratio,std::min(1.0,(double)actual/(double)total));
@@ -652,8 +660,8 @@ struct B11PersistingL2 {
 
   void stage(void* base, int channels) {
     if(!forwardActive) return;
-    testAssert(channels == 384 || channels == 768);
-    const size_t bytes = channels == 768 ? trunkBytes : innerBytes;
+    testAssert(channels == midChannels || channels == trunkChannels);
+    const size_t bytes = channels == trunkChannels ? trunkBytes : innerBytes;
     if(bytes == 0 && !windowSet) return;
     cudaStreamAttrValue attr = {};
     attr.accessPolicyWindow.base_ptr = bytes == 0 ? nullptr : base;
@@ -733,8 +741,10 @@ struct CudaHandles {
   bool b11FastNorm = false;
   bool b11FastRope = false;
   int b11GemmMask = 0;
-  int b11Affine384 = 0;
-  int b11Affine768 = 0;
+  // Vector width for the profile's inner (mid) and trunk channel counts. The
+  // legacy names keep the b11c768 widths; for b15 they mean 512 and 1024.
+  int b11AffineMid = 0;
+  int b11AffineTrunk = 0;
   int b11AffineThreads = 128;
   bool b11FullMask = false;
   bool loggedB11Norm = false;
@@ -743,6 +753,10 @@ struct CudaHandles {
   bool b11TanhFFN = false;
   bool loggedB11TanhFFN = false;
   bool loggedB11Attention = false;
+  // Detected shape-specialization profile (all-zero when the specialization is
+  // inactive). Every geometry-dependent fast-path gate reads its widths here
+  // instead of hardcoding the b11c768 constants.
+  B11SpecProfile b11Profile;
   std::unique_ptr<B11PersistingL2> b11L2;
   // Fuse each transformer block's masked residual add into the next block's pre-norm kernel.
   // Numerically identical to the unfused path, kept as an escape hatch for debugging and
@@ -1377,8 +1391,10 @@ struct ConvLayer {
       // matching cuBLAS's expectation. Same as MatMulLayer.
       int tokens = batchSize * matmulSpatialSize;
 #ifdef USE_B11_GEMM
-      const int b11Bit = outChannels == 384 && inChannels == 768 ? 4 :
-        (outChannels == 768 && inChannels == 384 ? 8 : 0);
+      // bit 4: trunk->mid, bit 8: mid->trunk (widths come from the active profile)
+      const B11SpecProfile& b11p = cudaHandles->b11Profile;
+      const int b11Bit = (outChannels == b11p.midChannels && inChannels == b11p.trunkChannels) ? 4 :
+        (outChannels == b11p.trunkChannels && inChannels == b11p.midChannels ? 8 : 0);
       if(usingFP16 && tryB11Gemm(cudaHandles,name,b11Bit,inputBuf,matmulWeightBuf.buf,
           outputBuf,tokens,outChannels,inChannels,accumulate)) return;
 #endif
@@ -1961,8 +1977,10 @@ struct BatchNormLayer {
     void* outputBuf
   ) const {
 #ifdef KATAGO_GPU_CUDA
-    const int b11Width = numChannels == 384 ? cudaHandles->b11Affine384 :
-      (numChannels == 768 ? cudaHandles->b11Affine768 : 0);
+    // Widths come from the active profile (b11c768: 384/768, b15: 512/1024).
+    const B11SpecProfile& b11p = cudaHandles->b11Profile;
+    const int b11Width = (numChannels == b11p.midChannels && isB11AffineWidth(numChannels)) ? cudaHandles->b11AffineMid :
+      ((numChannels == b11p.trunkChannels && isB11AffineWidth(numChannels)) ? cudaHandles->b11AffineTrunk : 0);
     if(b11Width != 0 && usingFP16 && usingNHWC && nnXLen == 19 && nnYLen == 19 &&
        activation == ACTIVATION_SILU && batchSize == cudaHandles->b11BatchSize &&
        launchB11AffineSiluCandidate((const half*)inputBuf,(half*)outputBuf,
@@ -2055,8 +2073,12 @@ struct MatMulLayer {
     assert(inChannels > 0 && outChannels > 0);
 
 #ifdef USE_B11_GEMM
-    const int b11Bit = outChannels == 384 && inChannels == 384 ? 1 :
-      (outChannels == 384 && inChannels == 1152 ? 2 : 0);
+    // bit 1: mid->mid (attention outProj), bit 2: ffn->mid (FFN linear2).
+    // b15 prunes the FFN hidden width per block, so bit 2 matches the profile's
+    // width envelope rather than one constant.
+    const B11SpecProfile& b11p = cudaHandles->b11Profile;
+    const int b11Bit = (outChannels == b11p.midChannels && inChannels == b11p.midChannels) ? 1 :
+      (outChannels == b11p.midChannels && b11p.acceptsFfnWidth(inChannels) ? 2 : 0);
     if(usingFP16 && tryB11Gemm(cudaHandles,name,b11Bit,inputBuf,matBuf.buf,
         outputBuf,batchSize,outChannels,inChannels,accumulate)) return;
 #endif
@@ -2150,7 +2172,8 @@ static void applySharedInputStridedMatMuls(
 ) {
   const long long weightStrideElts = (long long)inChannels * outChannels;
 #ifdef USE_B11_GEMM
-  if(usingFP16 && count == 1 && outChannels == 1152 && inChannels == 384 &&
+  if(usingFP16 && count == 1 && outChannels == cudaHandles->b11Profile.qkvN() &&
+     inChannels == cudaHandles->b11Profile.midChannels &&
      tryB11Gemm(cudaHandles,name,16,inputBuf,packedWeights,outputBuf,
        batchSize,outChannels,inChannels,false)) return;
 #endif
@@ -2641,7 +2664,7 @@ struct NestedBottleneckResidualBlock {
     SizedBuf<void*> mid(scratch->allocator, scratch->getBufSizeXY(normActConv1.outChannels));
     SizedBuf<void*> midScratch(scratch->allocator, scratch->getBufSizeXY(normActConv1.outChannels));
     assert(normActConv1.outChannels == normActConv2.inChannels);
-    normActConv1.apply(cudaHandles,scratch,batchSize,false,trunkBuf,trunkScratchBuf,mid.buf,maskBuf,workspaceBuf,workspaceBytes,mid.buf,384);
+    normActConv1.apply(cudaHandles,scratch,batchSize,false,trunkBuf,trunkScratchBuf,mid.buf,maskBuf,workspaceBuf,workspaceBytes,mid.buf,normActConv1.outChannels);
     blocks.apply(
       cudaHandles,
       scratch,
@@ -2653,7 +2676,7 @@ struct NestedBottleneckResidualBlock {
       workspaceBuf,
       workspaceBytes
     );
-    normActConv2.apply(cudaHandles,scratch,batchSize,true,mid.buf,midScratch.buf,trunkBuf,maskBuf,workspaceBuf,workspaceBytes,trunkBuf,768);
+    normActConv2.apply(cudaHandles,scratch,batchSize,true,mid.buf,midScratch.buf,trunkBuf,maskBuf,workspaceBuf,workspaceBytes,trunkBuf,normActConv2.outChannels);
   }
 
 };
@@ -2707,10 +2730,15 @@ struct TransformerRMSNormLayer {
   ) const {
     // RMSNormGammaBetaNHWC with gamma=weight, beta=zero, mask, identity activation.
 #ifdef KATAGO_GPU_CUDA
-    if(usingFP16 && cudaHandles->b11FastNorm && numChannels == 384 && xySize == 361 &&
+    // The warp RMSNorm kernel is instantiated for 384/512/1024 only, and the
+    // width must belong to the active profile (mid, or a 1024-wide trunk).
+    const B11SpecProfile& b11p = cudaHandles->b11Profile;
+    const bool b11NormWidth = isB11RmsNormWidth(numChannels) &&
+      (numChannels == b11p.midChannels || numChannels == b11p.trunkChannels);
+    if(usingFP16 && cudaHandles->b11FastNorm && b11NormWidth && xySize == 361 &&
        batchSize == cudaHandles->b11BatchSize) {
       launchB11RmsNorm((half*)inputBuf,(const half*)residualDeltaBuf,(half*)outputBuf,
-        (const half*)weightBuf.buf,(const half*)maskBuf,batchSize*xySize,epsilon,cudaHandles->stream);
+        (const half*)weightBuf.buf,(const half*)maskBuf,batchSize*xySize,epsilon,numChannels,cudaHandles->stream);
       CUDA_ERR(name.c_str(),cudaPeekAtLastError());
       if(!cudaHandles->loggedB11Norm) {
         cudaHandles->loggedB11Norm = true;
@@ -3121,9 +3149,12 @@ struct TransformerAttentionBlock {
       testAssert(qTotalDim % 8 == 0 && kTotalDim % 8 == 0);
 #ifdef USE_B11_GEMM
       if(cudaHandles->b11QkvRope && batchSize == cudaHandles->b11BatchSize &&
-         combinedN == 1152 && inChannels == 384 && useRope && learnableRope && seqLen == 361) {
+         combinedN == cudaHandles->b11Profile.qkvN() &&
+         inChannels == cudaHandles->b11Profile.midChannels &&
+         useRope && learnableRope && seqLen == 361) {
         CUDA_ERR(name.c_str(),CudaB11QkvRope::run((const half*)trunkScratchBuf,
           (const half*)qkvPackedWeights.buf,(half*)qkvBuf.buf,matBatchSize,
+          cudaHandles->b11Profile.midChannels,
           (const float*)ropeFreqsBuf.buf,cudaHandles->stream));
         b11QkvRopeApplied = true;
       }
@@ -3180,10 +3211,12 @@ struct TransformerAttentionBlock {
       testAssert(fuseQK || !useCombinedQKV);
 #ifdef KATAGO_GPU_CUDA
       if(usingFP16 && cudaHandles->b11FastRope && learnableRope && seqLen == 361 &&
-         numHeads == 12 && numKVHeads == 12 && qHeadDim == 32 &&
+         numHeads == cudaHandles->b11Profile.numHeads &&
+         numKVHeads == cudaHandles->b11Profile.numKVHeads &&
+         qHeadDim == cudaHandles->b11Profile.headDim &&
          batchSize == cudaHandles->b11BatchSize && qStrideElts == kvStrideElts) {
         launchB11Rope((half*)qPtr,(half*)kPtr,(const float*)ropeFreqsBuf.buf,
-          batchSize,qStrideElts,cudaHandles->stream);
+          batchSize,qStrideElts,cudaHandles->b11Profile.ropePairs(),cudaHandles->stream);
       }
       else
 #endif
@@ -3251,27 +3284,60 @@ struct TransformerAttentionBlock {
     bool usedSDPA = false;
     // The mma kernel consumes the raw per-position mask directly, so unlike cudnn SDPA the
     // masked path needs no materialized [B,S,S] attention bias at all.
+    // The AOT artifacts are baked for one packed-QKV row width per profile, so the
+    // row stride the caller is about to feed in selects the artifact set.
+    const B11SpecProfile& b11AttnProfile = cudaHandles->b11Profile;
+    const bool b11PackedQkv = (qStrideElts == b11AttnProfile.qkvN());
+    const bool b11AttnRowOk = (qStrideElts == kvStrideElts) &&
+      (qStrideElts == b11AttnProfile.midChannels || qStrideElts == b11AttnProfile.qkvN());
+    // Both feed only the AOT attention paths. A plain build keeps the whole
+    // specialization off (b11AttentionTile == 0), so they are legitimately idle.
+    (void)b11PackedQkv;
+    (void)b11AttnRowOk;
     if(usingFP16 && cudaHandles->mmaAttentionEnabled && cudaHandles->b11AttentionTile != 0 &&
-#ifdef USE_B11_STATIC_FA4
-       b11aot::supportsStaticFa4(batchSize,qStrideElts == 1152) &&
+#if defined(USE_B11_AOT_STATIC)
+       b11aot::supportsStaticFa4Geometry(batchSize,b11PackedQkv,qStrideElts) &&
+#elif defined(USE_B11_FA4)
+       // Any AOT artifact set (schema 1 or 2) defines USE_B11_FA4, so the guard
+       // is present whenever b11aot is included. The plain build defines neither
+       // and drops the clause entirely rather than referencing an unknown name.
+       b11aot::supportsStaticFa4(batchSize,b11PackedQkv) &&
 #endif
-       batchSize == cudaHandles->b11BatchSize && seqLen == 361 && numHeads == 12 &&
-       numKVHeads == 12 && qHeadDim == 32 && vHeadDim == 32) {
+       batchSize == cudaHandles->b11BatchSize && seqLen == 361 &&
+       numHeads == b11AttnProfile.numHeads && numKVHeads == b11AttnProfile.numKVHeads &&
+       qHeadDim == b11AttnProfile.headDim && vHeadDim == b11AttnProfile.headDim) {
+      const float b11AttnScale = 1.0f / sqrtf(float(b11AttnProfile.headDim));
+      (void)b11AttnScale;
+#ifdef USE_B11_AOT_STATIC
+      if((cudaHandles->b11AttentionTile == 6 || cudaHandles->b11AttentionTile == 8) &&
+         maskBuf == nullptr && batchSize >= 1 && batchSize <= 96 && b11AttnRowOk) {
+        CUDA_ERR(name.c_str(),b11aot::launchStaticFa4(qPtr,kPtr,vPtr,attnOutBuf.buf,nullptr,
+          batchSize,b11AttnScale,qStrideElts,false,cudaHandles->stream));
+        usedSDPA = true;
+      }
+      if((cudaHandles->b11AttentionTile == 7 || cudaHandles->b11AttentionTile == 8) &&
+         maskBuf != nullptr && batchSize >= 1 && batchSize <= 96 && b11AttnRowOk) {
+        CUDA_ERR(name.c_str(),b11aot::launchStaticFa4(qPtr,kPtr,vPtr,attnOutBuf.buf,(void*)maskBuf,
+          batchSize,b11AttnScale,qStrideElts,true,cudaHandles->stream));
+        usedSDPA = true;
+      }
+#else
 #ifdef USE_B11_FA4
       if((cudaHandles->b11AttentionTile == 6 || cudaHandles->b11AttentionTile == 8) && maskBuf == nullptr && batchSize >= 1 && batchSize <= 96 &&
-         qStrideElts == kvStrideElts && (qStrideElts == 384 || qStrideElts == 1152)) {
+         b11AttnRowOk) {
         CUDA_ERR(name.c_str(),b11_fa4_exact_m128_n96_s1_launch(qPtr,kPtr,vPtr,attnOutBuf.buf,nullptr,
-          batchSize,1.0f/sqrtf(32.0f),qStrideElts == 1152,cudaHandles->stream));
+          batchSize,b11AttnScale,b11PackedQkv,cudaHandles->stream));
         usedSDPA = true;
       }
 #endif
 #ifdef USE_B11_MASKED_FA4
       if((cudaHandles->b11AttentionTile == 7 || cudaHandles->b11AttentionTile == 8) && maskBuf != nullptr && batchSize >= 1 && batchSize <= 96 &&
-         qStrideElts == kvStrideElts && (qStrideElts == 384 || qStrideElts == 1152)) {
+         b11AttnRowOk) {
         CUDA_ERR(name.c_str(),b11_fa4_mask_m128_n96_s1_launch(qPtr,kPtr,vPtr,attnOutBuf.buf,(void*)maskBuf,
-          batchSize,1.0f/sqrtf(32.0f),qStrideElts == 1152,cudaHandles->stream));
+          batchSize,b11AttnScale,b11PackedQkv,cudaHandles->stream));
         usedSDPA = true;
       }
+#endif
 #endif
       if(usedSDPA && !cudaHandles->loggedB11Attention) {
         cudaHandles->loggedB11Attention = true;
@@ -3735,7 +3801,7 @@ struct TransformerFFNBlock {
       const half* wGate = w1 + (size_t)ffnChannels * numChannels;
 #if defined(USE_B11_FA4) && defined(USE_B11_MASKED_FA4) && defined(USE_B11_GEMM)
       if(isB11TanhFFNLaunchEligible(cudaHandles->b11TanhFFN,batchSize,cudaHandles->b11BatchSize,
-           nnXLen,nnYLen,numChannels,ffnChannels,usingFP16,usingNHWC)) {
+           nnXLen,nnYLen,numChannels,ffnChannels,cudaHandles->b11Profile,usingFP16,usingNHWC)) {
         CudaB11FFN::runSwiGLU(
           (const half*)trunkScratchBuf,w1,wGate,(half*)ffnBuf.buf,
           matBatchSize,ffnChannels,numChannels,cudaHandles->stream);
@@ -4293,7 +4359,8 @@ struct Trunk {
 
 #ifdef KATAGO_GPU_CUDA
     B11L2ForwardScope b11L2Scope(cudaHandles->b11L2.get(),cudaHandles->stream,batchSize);
-    if(cudaHandles->b11L2 != nullptr) cudaHandles->b11L2->stage(trunkScratch.buf,768);
+    if(cudaHandles->b11L2 != nullptr)
+      cudaHandles->b11L2->stage(trunkScratch.buf,cudaHandles->b11Profile.trunkChannels);
     //Feed the conv into trunkScratch.buf, not trunkBuf
     initialConv->apply(cudaHandles,scratch,batchSize,false,inputBuf,trunkScratch.buf,workspaceBuf,workspaceBytes);
 #else  // KATAGO_GPU_HIP
@@ -5164,8 +5231,8 @@ struct ComputeContext {
   bool b11FastNorm;
   bool b11FastRope;
   int b11GemmMask;
-  int b11Affine384;
-  int b11Affine768;
+  int b11AffineMid;
+  int b11AffineTrunk;
   int b11AffineThreads;
   int b11L2Mode;
   double b11L2HitRatio;
@@ -5237,8 +5304,11 @@ ComputeContext* NeuralNet::createComputeContext(
   context->b11FastNorm = !cfg.contains("cudaB11FastNorm") || cfg.getBool("cudaB11FastNorm");
   context->b11FastRope = !cfg.contains("cudaB11FastRope") || cfg.getBool("cudaB11FastRope");
   context->b11GemmMask = cfg.contains("cudaB11GemmMask") ? cfg.getInt("cudaB11GemmMask",0,31) : 31;
-  context->b11Affine384 = cfg.contains("cudaB11Affine384") ? cfg.getInt("cudaB11Affine384",0,8) : 8;
-  context->b11Affine768 = cfg.contains("cudaB11Affine768") ? cfg.getInt("cudaB11Affine768",0,8) : 8;
+  // Legacy key names are retained for configuration compatibility. "384" and
+  // "768" denote the profile's mid and trunk channel counts, which are 384/768
+  // for b11c768 and 512/1024 for b15.
+  context->b11AffineMid = cfg.contains("cudaB11Affine384") ? cfg.getInt("cudaB11Affine384",0,8) : 8;
+  context->b11AffineTrunk = cfg.contains("cudaB11Affine768") ? cfg.getInt("cudaB11Affine768",0,8) : 8;
   context->b11AffineThreads = cfg.contains("cudaB11AffineThreads") ? cfg.getInt("cudaB11AffineThreads",128,256) : 128;
   // -1 = automatic only for validated per-device concurrency. Unknown topology
   // is always off, including custom callers which do not submit the thread map.
@@ -5246,8 +5316,8 @@ ComputeContext* NeuralNet::createComputeContext(
   context->b11L2HitRatio = cfg.contains("cudaB11L2HitRatio") ? cfg.getDouble("cudaB11L2HitRatio",0.01,1.0) : 1.0;
   context->b11QkvRope = !cfg.contains("cudaB11QkvRope") || cfg.getBool("cudaB11QkvRope");
   context->b11TanhFFN = !cfg.contains("cudaB11TanhFFN") || cfg.getBool("cudaB11TanhFFN");
-  if((context->b11Affine384 != 0 && context->b11Affine384 != 4 && context->b11Affine384 != 8) ||
-     (context->b11Affine768 != 0 && context->b11Affine768 != 4 && context->b11Affine768 != 8) ||
+  if((context->b11AffineMid != 0 && context->b11AffineMid != 4 && context->b11AffineMid != 8) ||
+     (context->b11AffineTrunk != 0 && context->b11AffineTrunk != 4 && context->b11AffineTrunk != 8) ||
      (context->b11AffineThreads != 128 && context->b11AffineThreads != 256))
     throw StringError("cudaB11Affine384/768 must be 0, 4, or 8; cudaB11AffineThreads must be 128 or 256");
   return context;
@@ -5384,14 +5454,19 @@ struct ComputeHandle {
     bool b11ProfilePrepared = false;
     if(context->b11Enabled && cudaHandles->mmaAttentionEnabled &&
        isB11CudaHardwareLayoutEligible(b11Prop.name,majorComputeCapability,minorComputeCapability,
-         useFP16,useNHWC,nnXLen,nnYLen) && isB11OptimizedBatch(maxBatchSize) &&
-       isOfficialB11C768(loadedModel->modelDesc)) {
+         useFP16,useNHWC,nnXLen,nnYLen) && isB11OptimizedBatch(maxBatchSize)) {
+      // Structural detection, not a checkpoint-name match: the profile table in
+      // cudab11profile.h carries one entry per geometry that has kernel
+      // instantiations (tf3-b11c768 and b15 ffn-pruned).
+      const B11SpecProfile detectedProfile = detectB11SpecProfile(loadedModel->modelDesc);
+      if(detectedProfile.valid() && isB11SpecGeometryInstanced(detectedProfile)) {
+      cudaHandles->b11Profile = detectedProfile;
       cudaHandles->b11AttentionTile = context->b11AttentionTile;
       cudaHandles->b11FastNorm = context->b11FastNorm;
       cudaHandles->b11FastRope = context->b11FastRope;
       cudaHandles->b11GemmMask = context->b11GemmMask;
-      cudaHandles->b11Affine384 = context->b11Affine384;
-      cudaHandles->b11Affine768 = context->b11Affine768;
+      cudaHandles->b11AffineMid = context->b11AffineMid;
+      cudaHandles->b11AffineTrunk = context->b11AffineTrunk;
       cudaHandles->b11AffineThreads = context->b11AffineThreads;
       cudaHandles->b11BatchSize = maxBatchSize;
       if(context->b11QkvRope && context->b11FastRope && (context->b11GemmMask & 16)) {
@@ -5404,13 +5479,45 @@ struct ComputeHandle {
       if(l2Mode != 0 && streams > 0) {
         cudaHandles->b11L2 = std::make_unique<B11PersistingL2>();
         cudaHandles->b11L2->configure(b11Device,maxBatchSize,l2Mode,
-          streams,context->b11L2HitRatio,context,logger);
+          streams,context->b11L2HitRatio,context,logger,
+          detectedProfile.trunkChannels,detectedProfile.midChannels);
       }
+      // The FA4 AOT artifacts are baked for one packed-QKV row width per profile.
+      // If this build carries no bundle for the detected geometry, drop only the
+      // AOT attention tile: every other fast path stays active and the attention
+      // block falls back to the runtime mma kernel.
+      bool b11AotAttentionReady = true;
+#ifdef USE_B11_AOT_STATIC
+      b11AotAttentionReady = b11aot::hasStaticFa4For(detectedProfile.qkvN());
+      if(b11AotAttentionReady) {
+        if(context->b11AttentionTile == 6 || context->b11AttentionTile == 8)
+          CUDA_ERR("B11 exact AOT prepare",b11aot::prepareStaticFa4(detectedProfile.qkvN(),false));
+        if(context->b11AttentionTile == 7 || context->b11AttentionTile == 8)
+          CUDA_ERR("B11 masked AOT prepare",b11aot::prepareStaticFa4(detectedProfile.qkvN(),true));
+      }
+#else
       if(context->b11AttentionTile == 6 || context->b11AttentionTile == 8)
         CUDA_ERR("B11 exact AOT prepare",b11_fa4_exact_m128_n96_s1_prepare());
       if(context->b11AttentionTile == 7 || context->b11AttentionTile == 8)
         CUDA_ERR("B11 masked AOT prepare",b11_fa4_mask_m128_n96_s1_prepare());
+#endif
+      if(!b11AotAttentionReady) {
+        cudaHandles->b11AttentionTile = 0;
+        if(logger != nullptr)
+          logger->write("CUDA B11 specialization: no FA4 AOT bundle for packed QKV row " +
+            Global::intToString(detectedProfile.qkvN()) + "; using the runtime mma attention kernel");
+      }
       b11ProfilePrepared = true;
+      if(logger != nullptr)
+        logger->write("CUDA B11 specialization: trunk " + Global::intToString(detectedProfile.trunkChannels) +
+          " inner " + Global::intToString(detectedProfile.midChannels) +
+          " ffn " + Global::intToString(detectedProfile.ffnMinChannels) + ".." +
+          Global::intToString(detectedProfile.ffnMaxChannels) +
+          (detectedProfile.ffnUniform ? " (uniform)" : " (per-block pruned)") +
+          " heads " + Global::intToString(detectedProfile.numHeads) + "x" +
+          Global::intToString(detectedProfile.headDim) +
+          " blocks " + Global::intToString(detectedProfile.numBlocks));
+      }
     }
 #endif
 #ifdef USE_CUTLASS_FUSED_FFN
@@ -5440,7 +5547,10 @@ struct ComputeHandle {
     // weight-layout decision. A failed B11 probe must leave generic FFN intact.
 #if defined(USE_CUTLASS_FUSED_FFN) && defined(USE_B11_FA4) && defined(USE_B11_MASKED_FA4) && defined(USE_B11_GEMM)
     if(b11ProfilePrepared && context->b11TanhFFN && cudaHandles->fusedFFNEnabled &&
-       CudaB11FFN::supportsShape(1152,384)) {
+       CudaB11FFN::supportsShape(cudaHandles->b11Profile.ffnMinChannels,
+         cudaHandles->b11Profile.midChannels) &&
+       CudaB11FFN::supportsShape(cudaHandles->b11Profile.ffnMaxChannels,
+         cudaHandles->b11Profile.midChannels)) {
       cudaHandles->b11TanhFFN = CudaB11FFN::supportedOnCurrentDevice();
       if(!cudaHandles->b11TanhFFN && logger != nullptr)
         logger->write("WARNING: CUDA B11 tanh FFN probe failed; keeping original CUTLASS FFN");

@@ -123,7 +123,14 @@ DualGemm::Arguments makeArgs(const half* A,const half* w1,const half* wGate,
 
 namespace CudaB11FFN {
 bool supportsShape(int N,int K) {
-  if(N!=1152||K!=384)return false;
+  // N is the FFN hidden width and K the inner width. b11c768 uses one hidden
+  // width (1152) while b15 ffn-pruned prunes it per block (45 widths from 16 to
+  // 1160), so a width whitelist cannot express this. DualGemm::can_implement()
+  // validates exactly what matters -- operand alignment -- so it is the
+  // authoritative test. The 8-half multiple is the output leading dimension
+  // alignment; 4096 is far above the widest observed width.
+  if(N <= 0 || K <= 0 || (N & 7) != 0 || (K & 7) != 0 || N > 4096 || K > 4096)
+    return false;
   const auto* dummy=reinterpret_cast<const half*>(std::uintptr_t(256));
   const auto args=makeArgs(dummy,dummy,dummy,const_cast<half*>(dummy),128,N,K);
   return DualGemm::can_implement(args)==cutlass::Status::kSuccess&&
@@ -175,7 +182,8 @@ bool supportedOnCurrentDevice() {
 }
 void runSwiGLU(const half* A,const half* w1,const half* wGate,half* output,
   int M,int N,int K,cudaStream_t stream) {
-  if(!A||!w1||!wGate||!output||(M!=13*361&&M!=16*361)||N!=1152||K!=384||A==output||w1==output||wGate==output||
+  const bool shapeOk=N>0&&K>0&&(N&7)==0&&(K&7)==0&&N<=4096&&K<=4096;
+  if(!A||!w1||!wGate||!output||!shapeOk||(M!=13*361&&M!=16*361)||A==output||w1==output||wGate==output||
     ((std::uintptr_t(A)|std::uintptr_t(w1)|std::uintptr_t(wGate)|std::uintptr_t(output))&15))
     throw std::runtime_error("CudaB11FFN: invalid dimensions, alias, or unaligned operand");
   // Deliberately preserve the public production initialize/run wrapper. This

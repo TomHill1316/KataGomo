@@ -30,9 +30,19 @@ using Gemm = cutlass::gemm::device::Gemm<
   3, 8, 8, false>;
 
 inline bool isSupportedShape(int M, int N, int K) {
-  return M > 0 && (
-    (N == 384 && (K == 384 || K == 768 || K == 1152)) ||
-    ((N == 768 || N == 1152) && K == 384));
+  // The CUTLASS template itself is geometry-agnostic: can_implement() validates
+  // operand alignment and launch() re-checks the pointers, so this guard only
+  // rejects degenerate shapes cheaply, before any device query. Profile-specific
+  // shape membership is enforced by the caller's GEMM bit, which is derived from
+  // the detected profile. N and K must still be 8-half aligned because they are
+  // the leading dimensions of the RowMajor B and A operands.
+  if(M <= 0 || N <= 0 || K <= 0)
+    return false;
+  if((N & 7) != 0 || (K & 7) != 0)
+    return false;
+  // b15 ffn-pruned has a per-block hidden width; 4096 is far above the widest
+  // observed value (1160) and keeps the int-based problem coordinates safe.
+  return N <= 4096 && K <= 4096;
 }
 
 inline bool isAligned(const void* p) {

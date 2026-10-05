@@ -104,45 +104,62 @@ ROOT=/absolute/path/to/KataGo
 TOOLS="$ROOT/cpp/neuralnet/b11aot"
 PYTHON=/absolute/path/to/matching-build-environment/bin/python
 DEPS=/absolute/path/to/external-build-data/fa4-dependencies
-AOT=/absolute/path/to/external-build-data/fa4-static-b13-b16
+AOT=/absolute/path/to/external-build-data/fa4-static-b13-b16-b11
+AOT_B15=/absolute/path/to/external-build-data/fa4-static-b13-b16-b15
 CUDA=/usr/local/cuda-13.0
 BUILD=/absolute/path/to/external-build-data/engine-build
 
 # Prepare DEPS once using the earlier command, or reuse an intact pinned overlay.
+# One bundle per geometry; supply either, both or neither.
 "$PYTHON" "$TOOLS/generate_static_bundle.py" --dependency-root "$DEPS" \
-  --output-dir "$AOT" --cuda-root "$CUDA"
+  --output-dir "$AOT" --cuda-root "$CUDA" \
+  --profile-label b11 --heads 12 --head-dim 32 --sequence 361
+"$PYTHON" "$TOOLS/generate_static_bundle.py" --dependency-root "$DEPS" \
+  --output-dir "$AOT_B15" --cuda-root "$CUDA" \
+  --profile-label b15 --heads 16 --head-dim 32 --sequence 361
 cmake -S "$ROOT/cpp" -B "$BUILD" -DUSE_BACKEND=CUDA \
   -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc" -DCUDAToolkit_ROOT="$CUDA" \
-  -DKATAGO_B11_FA4_AOT_DIR="$AOT"
+  -DKATAGO_B11_FA4_AOT_DIR="$AOT" -DKATAGO_B15_FA4_AOT_DIR="$AOT_B15"
 cmake --build "$BUILD" --parallel 4
 ```
 
-The explicit output root must be new or empty. Its layout is:
+The explicit output root must be new or empty. Its layout is, for a bundle whose
+`--profile-label` is `<label>`:
 
 ```text
-fa4-static-b13-b16/
+fa4-static-b13-b16-<label>/
   bundle.json
-  b13/exact/b11_fa4_static_b13_exact_m128_n96_s1{.o,.h,.json,_api.h,_bridge.cpp}
-  b13/mask/b11_fa4_static_b13_mask_m128_n96_s1{.o,.h,.json,_api.h,_bridge.cpp}
-  b16/exact/b11_fa4_static_b16_exact_m128_n96_s1{.o,.h,.json,_api.h,_bridge.cpp}
-  b16/mask/b11_fa4_static_b16_mask_m128_n96_s1{.o,.h,.json,_api.h,_bridge.cpp}
+  b13/exact/<label>_fa4_static_b13_exact_m128_n96_s1{.o,.h,.json,_api.h,_bridge.cpp}
+  b13/mask/<label>_fa4_static_b13_mask_m128_n96_s1{.o,.h,.json,_api.h,_bridge.cpp}
+  b16/exact/<label>_fa4_static_b16_exact_m128_n96_s1{.o,.h,.json,_api.h,_bridge.cpp}
+  b16/mask/<label>_fa4_static_b16_mask_m128_n96_s1{.o,.h,.json,_api.h,_bridge.cpp}
 ```
+
+`<label>` is `b11` (H12 D32, packed QKV row 1152, output row 384) or `b15`
+(H16 D32, packed QKV row 1536, output row 512). The packed and output strides
+are derived from `heads*head_dim`, never written as literals.
 
 Each directory also retains PTX/cubin, provenance and licenses. The bundle lists
 four manifest hashes; each manifest hashes its object/header/API/safe bridge.
-CMake checks this chain, fixed B, S361/H12/D32, M128/N96/S1, FP16 QK/PV/I/O,
-packed stride 1152/output stride 384, pointer-only tensor ABI and ELF64 x86-64
-identity. Missing or mismatched entries are errors, not silent partial bundles.
+CMake checks this chain, fixed B, the profile's S361/H*/D32 geometry,
+M128/N96/S1, FP16 QK/PV/I/O, the derived packed/output stride, the bundle's own
+geometry block, pointer-only tensor ABI and ELF64 x86-64 identity. Missing or
+mismatched entries are errors, not silent partial bundles. Pointing a bundle at
+the other geometry's CMake variable fails closed on the label and stride checks.
 These checks establish consistency, not authenticity of untrusted downloads.
 
 `static_fa4_dispatch.cpp` preserves the existing two engine-level exact/mask
-entry points and routes B13/B16 to their objects. Both the bridges and
+entry points and routes B13/B16 to their objects, selecting the artifact set by
+the packed-QKV row width the engine is about to feed in. Both the bridges and
 `static_fa4_profile.h` reject other B or unpacked inputs. The engine must gate
 model/GPU/geometry/batch/packedness **before** launch and fall back to the generic
 backend when unsupported; an error return is not itself a fallback. Schema 2
-defines `USE_B11_STATIC_FA4`. Setup prepares both supported batches on the
-handle's current device; hot dispatch does no setup/device query, locks or
-allocation. Do not link both formats under the same engine symbols at once.
+defines one `USE_B11_STATIC_FA4` / `USE_B15_STATIC_FA4` per compiled-in geometry,
+plus `USE_B11_AOT_STATIC` whenever at least one static bundle is present; that
+last define is what routes attention through the dispatcher instead of the
+schema-1 symbols. Setup prepares both supported batches on the handle's current
+device; hot dispatch does no setup/device query, locks or allocation. Do not link
+both formats under the same engine symbols at once.
 
 The fixed-metadata method was first GPU-tested in a research binary at B13/B16,
 exact and masked modes. Those earlier measurements were research validation;
@@ -220,7 +237,8 @@ unchanged dataset loss or playing strength.
 ### Dynamic pair (schema 1, retained)
 
 Use the same CMake option `KATAGO_B11_FA4_AOT_DIR` to select an external
-artifact root with this layout:
+artifact root with this layout (the schema-1 path is retained for the b11c768
+geometry; `--profile-label`/`--heads` parameterize the symbol prefix):
 
 ```text
 artifacts/
@@ -261,7 +279,8 @@ validates each manifest's shape, precision, runtime batch range, symbol prefix,
 and hashes of the object, generated headers and safe bridge. An intact bundle
 may be relocated; recorded absolute provenance paths are not runtime inputs.
 
-Omit `KATAGO_B11_FA4_AOT_DIR` (the empty default) to build without FA4 artifacts;
+Omit both `KATAGO_B11_FA4_AOT_DIR` and `KATAGO_B15_FA4_AOT_DIR` (the empty
+defaults) to build without FA4 artifacts;
 generic CUDA attention remains available. This option does not narrow the
 engine's normal CUDA architecture list. An intentionally RTX5090-only local
 build may separately specify `-DKATAGO_CUDA_ARCHITECTURES=120`; omit that override

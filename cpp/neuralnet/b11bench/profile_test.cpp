@@ -15,37 +15,49 @@ void require(bool value,const std::string& label) {
   if(!value) throw std::runtime_error("FAILED: " + label);
 }
 
+// Geometry-agnostic form of the production gate. Both supported profiles pass;
+// everything else must not.
+bool matchesSpec(const ModelDesc& d) {
+  return detectB11SpecProfile(d).valid();
+}
+
 template<class T>
 void rejectMutation(ModelDesc& d,T& field,T replacement,const std::string& label) {
   const T saved = field;
   field = replacement;
-  const bool accepted = isOfficialB11C768(d);
+  const bool accepted = matchesSpec(d);
   field = saved;
   require(!accepted,label);
-  require(isOfficialB11C768(d),label + " restored");
+  require(matchesSpec(d),label + " restored");
 }
 
 void rejectNull(ModelDesc& d,unique_ptr_void& field,const std::string& label) {
   void* saved = field.release();
-  const bool accepted = isOfficialB11C768(d);
+  const bool accepted = matchesSpec(d);
   field.reset(saved);
   require(!accepted,label);
-  require(isOfficialB11C768(d),label + " restored");
+  require(matchesSpec(d),label + " restored");
 }
 
 void testModel(ModelDesc& d) {
-  require(isOfficialB11C768(d),"real official b11 model accepted");
+  const B11SpecProfile p = detectB11SpecProfile(d);
+  require(matchesSpec(d),"real specialized model accepted");
+  require(isB11SpecGeometryInstanced(p),"detected profile has kernel instantiations");
+  require(p.ffnMinChannels > 0 && p.ffnMaxChannels >= p.ffnMinChannels,"FFN width envelope detected");
+  require((p.ffnMinChannels % 8) == 0 && (p.ffnMaxChannels % 8) == 0,"FFN widths are 8-half aligned");
+  // The b11c768 predicate is the trunk-width projection of the same table.
+  require(isOfficialB11C768(d) == (p.trunkChannels == 768),"b11c768 predicate agrees with the table");
   rejectMutation(d,d.modelVersion,16,"modelVersion");
   rejectMutation(d,d.numInputChannels,23,"input channels");
   rejectMutation(d,d.numInputGlobalChannels,20,"global channels");
   rejectMutation(d,d.numInputMetaChannels,1,"metadata channels");
-  rejectMutation(d,d.trunk.trunkNumChannels,767,"trunk channels");
-  rejectMutation(d,d.trunk.numBlocks,10,"trunk declared blocks");
+  rejectMutation(d,d.trunk.trunkNumChannels,p.trunkChannels-1,"trunk channels");
+  rejectMutation(d,d.trunk.numBlocks,p.numBlocks-1,"trunk declared blocks");
   auto last = std::move(d.trunk.blocks.back());
   d.trunk.blocks.pop_back();
-  require(!isOfficialB11C768(d),"trunk actual blocks");
+  require(!matchesSpec(d),"trunk actual blocks");
   d.trunk.blocks.emplace_back(std::move(last));
-  require(isOfficialB11C768(d),"trunk actual blocks restored");
+  require(matchesSpec(d),"trunk actual blocks restored");
   for(std::size_t oi=0;oi<d.trunk.blocks.size();oi++) {
     auto& outer = d.trunk.blocks[oi];
     const std::string tag = "outer " + std::to_string(oi) + ": ";
@@ -55,11 +67,11 @@ void testModel(ModelDesc& d) {
     rejectMutation(d,n.numBlocks,5,tag+"declared inner blocks");
     auto tail = std::move(n.blocks.back());
     n.blocks.pop_back();
-    require(!isOfficialB11C768(d),tag+"actual inner blocks");
+    require(!matchesSpec(d),tag+"actual inner blocks");
     n.blocks.emplace_back(std::move(tail));
-    require(isOfficialB11C768(d),tag+"actual inner blocks restored");
-    rejectMutation(d,n.preBN.numChannels,767,tag+"preBN channels");
-    rejectMutation(d,n.postBN.numChannels,383,tag+"postBN channels");
+    require(matchesSpec(d),tag+"actual inner blocks restored");
+    rejectMutation(d,n.preBN.numChannels,p.trunkChannels-1,tag+"preBN channels");
+    rejectMutation(d,n.postBN.numChannels,p.midChannels-1,tag+"postBN channels");
     for(ConvLayerDesc* c : {&n.preConv,&n.postConv}) {
       rejectMutation(d,c->convXSize,3,tag+"conv X");
       rejectMutation(d,c->convYSize,3,tag+"conv Y");
@@ -75,15 +87,15 @@ void testModel(ModelDesc& d) {
       rejectMutation(d,item.first,ORDINARY_BLOCK_KIND,itag+"kind");
       if(ii%2 == 0) {
         auto& a = *static_cast<TransformerAttentionDesc*>(item.second.get());
-        rejectMutation(d,a.numHeads,11,itag+"heads");
-        rejectMutation(d,a.numKVHeads,11,itag+"KV heads");
-        rejectMutation(d,a.qHeadDim,31,itag+"Q head dim");
-        rejectMutation(d,a.vHeadDim,31,itag+"V head dim");
+        rejectMutation(d,a.numHeads,p.numHeads-1,itag+"heads");
+        rejectMutation(d,a.numKVHeads,p.numKVHeads-1,itag+"KV heads");
+        rejectMutation(d,a.qHeadDim,p.headDim-1,itag+"Q head dim");
+        rejectMutation(d,a.vHeadDim,p.headDim-1,itag+"V head dim");
         rejectMutation(d,a.useRope,false,itag+"RoPE");
         rejectMutation(d,a.learnableRope,false,itag+"learned RoPE");
-        rejectMutation(d,a.ropeNumKVHeads,11,itag+"RoPE KV heads");
-        rejectMutation(d,a.ropeNumPairs,15,itag+"RoPE pairs");
-        rejectMutation(d,a.preLN.numChannels,383,itag+"preLN channels");
+        rejectMutation(d,a.ropeNumKVHeads,p.numKVHeads-1,itag+"RoPE KV heads");
+        rejectMutation(d,a.ropeNumPairs,p.headDim/2-1,itag+"RoPE pairs");
+        rejectMutation(d,a.preLN.numChannels,p.midChannels-1,itag+"preLN channels");
         for(MatMulLayerDesc* m : {&a.qProj,&a.kProj,&a.vProj,&a.outProj}) {
           rejectMutation(d,m->inChannels,m->inChannels+1,itag+"projection input");
           rejectMutation(d,m->outChannels,m->outChannels+1,itag+"projection output");
@@ -91,10 +103,12 @@ void testModel(ModelDesc& d) {
       }
       else {
         auto& f = *static_cast<TransformerFFNDesc*>(item.second.get());
-        rejectMutation(d,f.numChannels,383,itag+"FFN channels");
-        rejectMutation(d,f.ffnChannels,1151,itag+"FFN hidden channels");
+        rejectMutation(d,f.numChannels,p.midChannels-1,itag+"FFN channels");
+        // +1 is both non-uniform and off the 8-half operand alignment, so it is
+        // rejected for the uniform b11c768 FFN and for b15's per-block widths.
+        rejectMutation(d,f.ffnChannels,f.ffnChannels+1,itag+"FFN hidden channels");
         rejectMutation(d,f.useSwiGLU,false,itag+"SwiGLU");
-        rejectMutation(d,f.preLN.numChannels,383,itag+"preLN channels");
+        rejectMutation(d,f.preLN.numChannels,p.midChannels-1,itag+"preLN channels");
         for(MatMulLayerDesc* m : {&f.linear1,&f.linearGate,&f.linear2}) {
           rejectMutation(d,m->inChannels,m->inChannels+1,itag+"projection input");
           rejectMutation(d,m->outChannels,m->outChannels+1,itag+"projection output");
@@ -104,10 +118,10 @@ void testModel(ModelDesc& d) {
   }
   const std::string savedName = d.name;
   d.name = "independent-of-checkpoint-name";
-  require(isOfficialB11C768(d),"checkpoint name is not part of profile");
+  require(matchesSpec(d),"checkpoint name is not part of profile");
   d.name = savedName;
   d.releaseWeights();
-  require(isOfficialB11C768(d),"released-weight descriptor accepted");
+  require(matchesSpec(d),"released-weight descriptor accepted");
 }
 
 void testHardwareAndBatch() {
@@ -172,43 +186,87 @@ void testConcurrencyAndL2() {
   require(!isB11AutoL2Eligible(INT_MIN,3),"L2 rejects invalid batch");
 }
 
+// Field order: trunk, mid, heads, kvHeads, headDim, blocks, ffnMin, ffnMax, ffnUniform.
+void testProfileTables() {
+  const B11SpecProfile b11{768,384,12,12,32,11,1152,1152,true};
+  const B11SpecProfile b15{1024,512,16,16,32,15,16,1160,false};
+  require(b11.valid() && b15.valid(),"table profiles valid");
+  require(b11.qkvN()==1152 && b15.qkvN()==1536,"packed QKV row width");
+  require(b11.ropePairs()==192 && b15.ropePairs()==256,"RoPE pair count");
+  require(b11.ffnChannels()==1152 && b15.ffnChannels()==0,"uniform FFN width exposed only when uniform");
+  require(b11.acceptsFfnWidth(1152) && !b11.acceptsFfnWidth(1088),"b11 envelope is exact");
+  require(b15.acceptsFfnWidth(16) && b15.acceptsFfnWidth(1160) && !b15.acceptsFfnWidth(1161),
+    "b15 envelope spans per-block widths and requires 8-half alignment");
+  require(isB11SpecGeometryInstanced(b11) && isB11SpecGeometryInstanced(b15),"both geometries instanced");
+  require(!isB11SpecGeometryInstanced(B11SpecProfile{}),"empty profile is not instanced");
+  require(!isB11SpecGeometryInstanced({768,384,12,12,32,10,1152,1152,true}),"wrong block count rejected");
+  require(!isB11SpecGeometryInstanced({768,384,12,12,32,11,1088,1152,false}),"b11 must stay uniform");
+  require(!isB11SpecGeometryInstanced({1024,512,16,16,64,15,16,1160,false}),"wrong head dim rejected");
+  require(!isB11SpecGeometryInstanced({1024,512,15,16,32,15,16,1160,false}),"head/width mismatch rejected");
+  require(!isB11SpecGeometryInstanced({1024,512,16,16,32,15,16,8192,false}),"b15 oversized FFN rejected");
+  require(!isB11SpecGeometryInstanced({1024,512,16,16,32,15,15,1160,false}),"b15 unaligned FFN rejected");
+  require(isB11RmsNormWidth(384) && isB11RmsNormWidth(512) && isB11RmsNormWidth(1024),"RMSNorm widths");
+  require(!isB11RmsNormWidth(768) && !isB11RmsNormWidth(240),"RMSNorm widths rejected");
+  require(isB11AffineWidth(384) && isB11AffineWidth(512) && isB11AffineWidth(768) && isB11AffineWidth(1024),"affine widths");
+  require(!isB11AffineWidth(240) && !isB11AffineWidth(0),"affine widths rejected");
+}
+
 void testTanhFFNLaunch() {
+  const B11SpecProfile b11{768,384,12,12,32,11,1152,1152,true};
+  const B11SpecProfile b15{1024,512,16,16,32,15,16,1160,false};
   for(int capacity=-2;capacity<=100;capacity++) {
     for(int actual=-2;actual<=100;actual++) {
       const bool expected=(capacity==13 || capacity==16) && actual==capacity;
-      require(isB11TanhFFNLaunchEligible(true,actual,capacity,19,19,384,1152,true,true)==expected,
+      require(isB11TanhFFNLaunchEligible(true,actual,capacity,19,19,384,1152,b11,true,true)==expected,
         "tanh FFN exact actual/capacity contract");
-      require(!isB11TanhFFNLaunchEligible(false,actual,capacity,19,19,384,1152,true,true),
+      require(!isB11TanhFFNLaunchEligible(false,actual,capacity,19,19,384,1152,b11,true,true),
         "tanh FFN requires completed preparation");
+      require(isB11TanhFFNLaunchEligible(true,actual,capacity,19,19,512,240,b15,true,true)==expected,
+        "b15 tanh FFN exact actual/capacity contract");
     }
   }
   for(int batch : {13,16}) {
-    require(!isB11TanhFFNLaunchEligible(true,batch,batch,13,19,384,1152,true,true),"FFN wrong X");
-    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,13,384,1152,true,true),"FFN wrong Y");
-    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,768,1152,true,true),"FFN wrong C");
-    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,384,768,true,true),"FFN wrong expansion");
-    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,384,1152,false,true),"FFN FP32");
-    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,384,1152,true,false),"FFN NCHW");
-    require(!isB11TanhFFNLaunchEligible(true,INT_MAX,batch,19,19,384,1152,true,true),"FFN huge actual");
-    require(!isB11TanhFFNLaunchEligible(true,INT_MIN,batch,19,19,384,1152,true,true),"FFN invalid actual");
+    require(!isB11TanhFFNLaunchEligible(true,batch,batch,13,19,384,1152,b11,true,true),"FFN wrong X");
+    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,13,384,1152,b11,true,true),"FFN wrong Y");
+    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,768,1152,b11,true,true),"FFN wrong C");
+    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,384,768,b11,true,true),"FFN wrong expansion");
+    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,384,1152,b11,false,true),"FFN FP32");
+    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,384,1152,b11,true,false),"FFN NCHW");
+    require(!isB11TanhFFNLaunchEligible(true,INT_MAX,batch,19,19,384,1152,b11,true,true),"FFN huge actual");
+    require(!isB11TanhFFNLaunchEligible(true,INT_MIN,batch,19,19,384,1152,b11,true,true),"FFN invalid actual");
+    // A profile whose geometry does not match the launched channels must not fire.
+    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,384,1152,b15,true,true),"b15 profile rejects b11 channels");
+    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,512,240,b11,true,true),"b11 profile rejects b15 channels");
+    require(!isB11TanhFFNLaunchEligible(true,batch,batch,19,19,512,240,B11SpecProfile{},true,true),"empty profile rejects");
   }
 }
 }
 
 int main(int argc,char** argv) {
   try {
-    if(argc < 2) throw std::runtime_error("usage: b11_profile_test B11_MODEL [DIFFERENT_VALID_MODEL ...]");
+    if(argc < 2) throw std::runtime_error("usage: b11_profile_test SPECIALIZED_MODEL [DIFFERENT_VALID_MODEL ...]");
     testHardwareAndBatch();
     testConcurrencyAndL2();
+    testProfileTables();
     testTanhFFNLaunch();
     ModelDesc d;
     ModelDesc::loadFromFileMaybeGZipped(argv[1],d,"");
-    std::cout << "MODEL " << d.name << " version=" << d.modelVersion << '\n';
+    const B11SpecProfile profile = detectB11SpecProfile(d);
+    require(profile.valid(),"primary model matches a specialized profile");
+    std::cout << "MODEL " << d.name << " version=" << d.modelVersion
+              << " trunk=" << profile.trunkChannels
+              << " inner=" << profile.midChannels
+              << " ffn=" << profile.ffnMinChannels << ".." << profile.ffnMaxChannels
+              << (profile.ffnUniform ? " (uniform)" : " (per-block pruned)")
+              << " heads=" << profile.numHeads << "x" << profile.headDim
+              << " blocks=" << profile.numBlocks << '\n';
     testModel(d);
     for(int i=2;i<argc;i++) {
       ModelDesc other;
       ModelDesc::loadFromFileMaybeGZipped(argv[i],other,"");
-      require(!isOfficialB11C768(other),"different valid model rejected: " + other.name);
+      const B11SpecProfile otherProfile = detectB11SpecProfile(other);
+      require(!otherProfile.valid() || otherProfile.trunkChannels != profile.trunkChannels,
+        "different valid model rejected: " + other.name);
       std::cout << "OTHER " << other.name << " rejected\n";
     }
     std::cout << "PASS " << checks << " CPU-only profile checks; no GPU initialized\n";

@@ -72,12 +72,27 @@ static void launch(const half* input, half* output, const half* scale,
 }
 } // namespace b11affine
 
+// Dispatch one fully-checked (channels,vectorWidth) pair. Channels is a
+// compile-time constant inside the kernel so vectorsPerRow folds away.
+template<int Channels>
+static void launchB11AffineSiluForChannels(
+  const half* input, half* output, const half* scale, const half* bias,
+  const half* mask, int count, int vectorWidth, int blockThreads, cudaStream_t stream
+) {
+  if(vectorWidth == 4) b11affine::launch<Channels,4>(input,output,scale,bias,mask,count,blockThreads,stream);
+  else b11affine::launch<Channels,8>(input,output,scale,bias,mask,count,blockThreads,stream);
+}
+
 bool launchB11AffineSiluCandidate(
   const half* input, half* output, const half* scale, const half* bias,
   const half* mask, int totalRows, int channels, int vectorWidth,
   int blockThreads, cudaStream_t stream
 ) {
-  if(totalRows <= 0 || (channels != 384 && channels != 768) ||
+  // Supported channel counts: 384/768 (b11c768 mid/trunk) and 512/1024 (b15
+  // mid/trunk). Each must be an exact multiple of both vector widths.
+  const bool channelsOk = (channels == 384 || channels == 768 ||
+                           channels == 512 || channels == 1024);
+  if(totalRows <= 0 || !channelsOk ||
      (vectorWidth != 4 && vectorWidth != 8) ||
      (blockThreads != 128 && blockThreads != 256) ||
      !input || !output || !scale || !bias) return false;
@@ -89,13 +104,11 @@ bool launchB11AffineSiluCandidate(
   const std::int64_t vectors = std::int64_t(totalRows) * (channels / vectorWidth);
   if(vectors > INT_MAX - 255) return false;
   const int count = static_cast<int>(vectors);
-  if(channels == 384) {
-    if(vectorWidth == 4) b11affine::launch<384,4>(input,output,scale,bias,mask,count,blockThreads,stream);
-    else b11affine::launch<384,8>(input,output,scale,bias,mask,count,blockThreads,stream);
-  }
-  else {
-    if(vectorWidth == 4) b11affine::launch<768,4>(input,output,scale,bias,mask,count,blockThreads,stream);
-    else b11affine::launch<768,8>(input,output,scale,bias,mask,count,blockThreads,stream);
+  switch(channels) {
+    case 384:  launchB11AffineSiluForChannels<384>(input,output,scale,bias,mask,count,vectorWidth,blockThreads,stream); break;
+    case 512:  launchB11AffineSiluForChannels<512>(input,output,scale,bias,mask,count,vectorWidth,blockThreads,stream); break;
+    case 768:  launchB11AffineSiluForChannels<768>(input,output,scale,bias,mask,count,vectorWidth,blockThreads,stream); break;
+    default:   launchB11AffineSiluForChannels<1024>(input,output,scale,bias,mask,count,vectorWidth,blockThreads,stream); break;
   }
   return true;
 }

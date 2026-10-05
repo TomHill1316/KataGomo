@@ -51,8 +51,14 @@ using StockEpilogue=StockKernel::Epilogue;
 using StockIterator=StockEpilogue::OutputTileIterator;
 using Swizzle=DeviceGemm::ThreadblockSwizzle;
 
+// Geometry-specialized RoPE store iterator. InnerChannels is the QKV input width
+// (b11c768: 384, b15: 512); the GEMM output width is 3*InnerChannels, laid out as
+// Q[C], K[C], V[C]. Only the Q and K columns [0,2C) are rotated; V passes through.
+template<int InnerChannels>
 class RopeStoreIterator : public StockIterator {
   using Base=StockIterator;
+  static_assert(InnerChannels>0 && InnerChannels%128==0,
+    "QKV inner width must be a positive multiple of the 128-wide epilogue N tile");
   const float* freqs_;
 public:
   using ThreadMap=typename Base::ThreadMap;
@@ -94,9 +100,9 @@ public:
             const int channel=this->thread_start_column()+col*ThreadMap::Delta::kColumn;
             // Q/K end on both 128-column CTA and 8-element access boundaries.
             // Tail-M lanes skip frequency reads; base iterator owns store predicates.
-            if(token<this->extent_row() && channel<768) {
+            if(token<this->extent_row() && channel<2*InnerChannels) {
               const int position=token%361;
-              const int firstPair=(channel>=384?channel-384:channel)/2;
+              const int firstPair=(channel>=InnerChannels?channel-InnerChannels:channel)/2;
               const int first=(fragRow*ThreadMap::Iterations::kColumn+col)*8;
               CUTLASS_PRAGMA_UNROLL
               for(int pair=0;pair<4;pair++) {
@@ -124,38 +130,41 @@ public:
   CUTLASS_DEVICE void store(Fragment const& fragment) const {store_with_byte_offset(fragment,0);}
 };
 
+template<int InnerChannels>
 using RopeEpilogue=cutlass::epilogue::threadblock::Epilogue<
   typename StockEpilogue::Shape,typename StockEpilogue::WarpMmaOperator,
-  StockEpilogue::kPartitionsK,RopeStoreIterator,
+  StockEpilogue::kPartitionsK,RopeStoreIterator<InnerChannels>,
   typename StockEpilogue::AccumulatorFragmentIterator,
   typename StockEpilogue::WarpTileIterator,typename StockEpilogue::SharedLoadIterator,
   typename StockEpilogue::OutputOp,typename StockEpilogue::Padding,
   StockEpilogue::kFragmentsPerIteration>;
 
+template<int InnerChannels>
 using RopeKernel=cutlass::gemm::kernel::Gemm<
-  typename StockKernel::Mma,RopeEpilogue,Swizzle,false>;
+  typename StockKernel::Mma,RopeEpilogue<InnerChannels>,Swizzle,false>;
 
-RopeKernel::Params makeParams(const half* A,const half* W,half* output,int M) {
-  const cutlass::gemm::GemmCoord problem(M,1152,384);
+template<int InnerChannels>
+typename RopeKernel<InnerChannels>::Params makeParams(const half* A,const half* W,half* output,int M) {
+  const cutlass::gemm::GemmCoord problem(M,3*InnerChannels,InnerChannels);
   const auto tiled=Swizzle().get_tiled_shape(problem,{128,128,32},1);
   auto* a=const_cast<Element*>(reinterpret_cast<const Element*>(A));
   auto* b=const_cast<Element*>(reinterpret_cast<const Element*>(W));
   auto* d=reinterpret_cast<Element*>(output);
-  return RopeKernel::Params(problem,tiled,{a,384},{b,1152},{d,1152},{d,1152},
+  return typename RopeKernel<InnerChannels>::Params(problem,tiled,
+    {a,InnerChannels},{b,3*InnerChannels},{d,3*InnerChannels},{d,3*InnerChannels},
     OutputOp::Params(Element(1.0f),Element(0.0f)),nullptr,nullptr,nullptr,nullptr);
 }
-} // namespace
 
-namespace CudaB11QkvRope {
-
-cudaError_t prepareForCurrentDevice() {
-  constexpr int sharedBytes=sizeof(RopeKernel::SharedStorage);
+template<int InnerChannels>
+cudaError_t prepareImpl() {
+  constexpr int sharedBytes=sizeof(typename RopeKernel<InnerChannels>::SharedStorage);
   if(sharedBytes<=48*1024)return cudaSuccess;
-  return cudaFuncSetAttribute(cutlass::Kernel<RopeKernel>,
+  return cudaFuncSetAttribute(cutlass::Kernel<RopeKernel<InnerChannels>>,
     cudaFuncAttributeMaxDynamicSharedMemorySize,sharedBytes);
 }
 
-cudaError_t run(const half* A,const half* W,half* output,int M,
+template<int InnerChannels>
+cudaError_t runImpl(const half* A,const half* W,half* output,int M,
   const float* freqs,cudaStream_t stream) {
   // Device/model/layout dispatch and buffer ownership belong to the caller.
   // Retain the validated fixed-19x19 shape range and cheap pointer checks.
@@ -163,12 +172,30 @@ cudaError_t run(const half* A,const half* W,half* output,int M,
     return cudaErrorInvalidValue;
   if((reinterpret_cast<std::uintptr_t>(A)|reinterpret_cast<std::uintptr_t>(W)|
       reinterpret_cast<std::uintptr_t>(output))&15)return cudaErrorInvalidValue;
-  auto params=makeParams(A,W,output,M);
+  auto params=makeParams<InnerChannels>(A,W,output,M);
   params.params_D.freqs=freqs;
   const dim3 grid=Swizzle().get_grid_shape(params.grid_tiled_shape);
-  cutlass::Kernel<RopeKernel><<<grid,RopeKernel::kThreadCount,
-    sizeof(RopeKernel::SharedStorage),stream>>>(params);
+  cutlass::Kernel<RopeKernel<InnerChannels>><<<grid,RopeKernel<InnerChannels>::kThreadCount,
+    sizeof(typename RopeKernel<InnerChannels>::SharedStorage),stream>>>(params);
   return cudaPeekAtLastError();
+}
+} // namespace
+
+namespace CudaB11QkvRope {
+
+cudaError_t prepareForCurrentDevice() {
+  cudaError_t err=prepareImpl<384>();
+  if(err!=cudaSuccess)return err;
+  return prepareImpl<512>();
+}
+
+cudaError_t run(const half* A,const half* W,half* output,int M,
+  int innerChannels,const float* freqs,cudaStream_t stream) {
+  switch(innerChannels) {
+    case 384: return runImpl<384>(A,W,output,M,freqs,stream);
+    case 512: return runImpl<512>(A,W,output,M,freqs,stream);
+    default: return cudaErrorInvalidValue;
+  }
 }
 
 } // namespace CudaB11QkvRope

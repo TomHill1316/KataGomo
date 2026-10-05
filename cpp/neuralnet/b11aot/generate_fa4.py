@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # AOT export/softmax setup follows doomoooo/KataGomo_fork; see NOTICE.md.
-"""CPU-only SM120 FA4: S361/H12/D32, FP16 QK/PV, dynamic or fixed packed layout."""
+"""CPU-only SM120 FA4 AOT: FP16 QK/PV, dynamic or fixed packed layout.
+
+The attention geometry (sequence length, head count, head dim) is a parameter
+rather than a constant, so one generator serves every shape-specialized profile
+that shares the SM120 M128/N96/S1 tile:
+  tf3-b11c768    : sequence 361, heads 12, head_dim 32 -> packed QKV row 1152
+  b15 ffn-pruned : sequence 361, heads 16, head_dim 32 -> packed QKV row 1536
+"""
 import argparse
 import hashlib
 import importlib.metadata
@@ -36,17 +43,27 @@ def parse_args():
     parser.add_argument("--tile-m", type=int, default=128)
     parser.add_argument("--tile-n", type=int, default=96)
     parser.add_argument("--num-stages", type=int, default=1)
+    parser.add_argument("--sequence", type=int, default=361,
+                        help="Fixed board sequence length (19x19); not a runtime dimension")
+    parser.add_argument("--heads", type=int, default=12,
+                        help="Attention heads; packed combined-QKV row is 3*heads*head_dim")
+    parser.add_argument("--head-dim", type=int, default=32)
+    parser.add_argument("--profile-label", default="b11",
+                        help="Geometry label used in the default symbol prefix and metadata")
     parser.add_argument("--probe-batch", type=int, default=16,
                         help="Metadata specialization sample; batch remains runtime")
     parser.add_argument("--max-batch", type=int, default=96)
     parser.add_argument("--fixed-batch", type=int, choices=(13, 16),
                         help="Schema 2: fixed metadata and packed-QKV strides, not runtime B")
-    parser.add_argument("--symbol-prefix", help="Unique C identifier; defaults to the mode/tile name")
+    parser.add_argument("--symbol-prefix", help="Unique C identifier; defaults to the geometry/mode/tile name")
     parser.add_argument("--allow-toolchain-mismatch", action="store_true",
                         help="Explicit migration experiment only; source hashes still must match")
     args = parser.parse_args()
-    if min(args.tile_m, args.tile_n, args.num_stages, args.probe_batch, args.max_batch) < 1:
-        parser.error("tile, stage and batch parameters must be positive")
+    if min(args.tile_m, args.tile_n, args.num_stages, args.probe_batch, args.max_batch,
+           args.sequence, args.heads, args.head_dim) < 1:
+        parser.error("tile, stage, batch, sequence and attention geometry parameters must be positive")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.profile_label):
+        parser.error("profile label must be a C identifier")
     if args.probe_batch > args.max_batch:
         parser.error("probe batch exceeds the runtime guard")
     if args.fixed_batch is not None:
@@ -55,7 +72,7 @@ def parse_args():
         args.probe_batch = args.max_batch = args.fixed_batch
     fixed_prefix = f"static_b{args.fixed_batch}_" if args.fixed_batch is not None else ""
     args.symbol_prefix = args.symbol_prefix or (
-        f"b11_fa4_{fixed_prefix}{args.mode}_m{args.tile_m}_n{args.tile_n}_s{args.num_stages}")
+        f"{args.profile_label}_fa4_{fixed_prefix}{args.mode}_m{args.tile_m}_n{args.tile_n}_s{args.num_stages}")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.symbol_prefix):
         parser.error("symbol prefix must be a C identifier")
     args.output_dir = args.output_dir.resolve()
@@ -138,9 +155,13 @@ def render_bridge(args):
     mask_arg = "&tm," if masked else ""
     fixed_batch = getattr(args, "fixed_batch", None)
     batch_guard = f"batch!={fixed_batch} || !packedQKV" if fixed_batch is not None else f"batch<1 || batch>{args.max_batch}"
-    layout_comment = (f"Fixed B{fixed_batch}, packed-QKV stride 1152; output stride 384."
+    # The packed combined-QKV row and the output row are both projections of the
+    # attention geometry, so they follow from heads*head_dim instead of a literal.
+    qkv_stride = 3 * args.heads * args.head_dim
+    output_stride = args.heads * args.head_dim
+    layout_comment = (f"Fixed B{fixed_batch}, packed-QKV stride {qkv_stride}; output stride {output_stride}."
                       if fixed_batch is not None else f"Batch is runtime, 1..{args.max_batch}; planar or packed QKV.")
-    tensors = f'''  constexpr int seq=361,heads=12,dim=32;
+    tensors = f'''  constexpr int seq={args.sequence},heads={args.heads},dim={args.head_dim};
   const int64_t stride=(packedQKV?3:1)*heads*dim;
   {p}_Tensor_mQ_t tq={{q,{{batch,seq,heads,dim}},{{seq*stride,stride,dim}}}};
   {p}_Tensor_mK_t tk={{k,{{batch,seq,heads,dim}},{{seq*stride,stride,dim}}}};
@@ -156,7 +177,7 @@ def render_bridge(args):
 #include <cuda_runtime_api.h>
 // prepare on the current eligible device before warmup/timing/graph capture.
 extern "C" cudaError_t {p}_prepare();
-// {args.mode}: mask must be {"nonnull FP16 [B,361]" if masked else "nullptr"}.
+// {args.mode}: mask must be {"nonnull FP16 [B," + str(args.sequence) + "]" if masked else "nullptr"}.
 // Every tensor must be 16-byte aligned. {layout_comment}
 extern "C" cudaError_t {p}_launch(void* q,void* k,void* v,void* output,
   void* mask,int batch,float scale,bool packedQKV,cudaStream_t stream);
@@ -235,16 +256,16 @@ def compile_artifact(args, dependencies):
         return utils.scalar_to_ssa(live, cutlass.Boolean)
 
     if not FlashAttentionForwardSm120.can_implement(
-        Float16,32,32,args.tile_m,args.tile_n,args.num_stages,128,False,False):
+        Float16,args.head_dim,args.head_dim,args.tile_m,args.tile_n,args.num_stages,128,False,False):
         raise ValueError("FA4 rejects this tile/stage configuration on SM120")
     masked = args.mode == "mask"
     forward = FlashAttentionForwardSm120(
-        Float16,32,32,1,is_causal=False,is_local=False,pack_gqa=False,
+        Float16,args.head_dim,args.head_dim,1,is_causal=False,is_local=False,pack_gqa=False,
         tile_m=args.tile_m,tile_n=args.tile_n,num_stages=args.num_stages,
         num_threads=128,Q_in_regs=False,score_mod=None,
         mask_mod=board_mask if masked else None,has_aux_tensors=masked,
         qk_acc_dtype=Float16,pv_acc_dtype=Float16)
-    batch, seq, heads, dim = args.probe_batch, 361, 12, 32
+    batch, seq, heads, dim = args.probe_batch, args.sequence, args.heads, args.head_dim
     fixed = getattr(args, "fixed_batch", None) is not None
     make_tensor = static_fp16_tensor if fixed else dynamic_fp16_tensor
     tensors = []
@@ -297,7 +318,7 @@ def main():
     metadata = {
         "schema":2 if args.fixed_batch is not None else 1,"mode":args.mode,"symbol_prefix":p,
         "prepare_symbol":p+"_prepare","launch_symbol":p+"_launch",
-        "fixed_shape":{"sequence":361,"heads":12,"head_dim":32},
+        "fixed_shape":{"sequence":args.sequence,"heads":args.heads,"head_dim":args.head_dim},
         "runtime_batch":{"minimum":args.fixed_batch or 1,"maximum":args.max_batch,"probe":args.probe_batch},
         "tile":{"m":args.tile_m,"n":args.tile_n,"stages":args.num_stages,"threads":128},
         "io":"fp16","accumulation":{"qk":"fp16","pv":"fp16"},
@@ -315,7 +336,8 @@ def main():
     }
     if args.fixed_batch is not None:
         metadata.update(fixed_batch=args.fixed_batch,target="sm120",
-            tensor_abi="pointer_only",qkv_layout="packed",qkv_stride=1152,output_stride=384)
+            tensor_abi="pointer_only",qkv_layout="packed",
+            qkv_stride=3*args.heads*args.head_dim,output_stride=args.heads*args.head_dim)
     (args.output_dir / f"{p}.json").write_text(json.dumps(metadata,indent=2)+"\n")
     shutil.copytree(HERE/"licenses",args.output_dir/"licenses")
     shutil.copyfile(HERE/"NOTICE.md",args.output_dir/"NOTICE.md")

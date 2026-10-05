@@ -42,13 +42,14 @@ extern "C" int32_t cute_dsl_{prefix}_wrapper({prefix}_Kernel_Module_t*,{args},fl
 '''
 
 
-def make_fixture(root, static=True):
+def make_fixture(root, static=True, label="b11", heads=12):
     for batch in ((13,16) if static else (0,)):
         for mode in ("exact","mask"):
-            prefix = f"b11_fa4_{'static_b'+str(batch)+'_' if static else ''}{mode}_m128_n96_s1"
+            prefix = f"{label}_fa4_{'static_b'+str(batch)+'_' if static else ''}{mode}_m128_n96_s1"
             directory = root / (f"b{batch}" if static else "") / mode
             directory.mkdir(parents=True)
-            args = SimpleNamespace(symbol_prefix=prefix,mode=mode,max_batch=batch or 96,fixed_batch=batch or None)
+            args = SimpleNamespace(symbol_prefix=prefix,mode=mode,max_batch=batch or 96,
+                fixed_batch=batch or None,heads=heads,head_dim=32,sequence=361)
             api,bridge = render_bridge(args)
             # A minimal ELF64 identity prefix is enough for the non-linking fixture.
             elf = bytearray(64)
@@ -60,15 +61,16 @@ def make_fixture(root, static=True):
             (directory/(prefix+"_bridge.cpp")).write_text(bridge)
             item = dict(schema=2 if static else 1,mode=mode,symbol_prefix=prefix,
                 prepare_symbol=prefix+"_prepare",launch_symbol=prefix+"_launch",
-                fixed_shape=dict(sequence=361,heads=12,head_dim=32),
+                fixed_shape=dict(sequence=361,heads=heads,head_dim=32),
                 runtime_batch=dict(minimum=batch or 1,maximum=batch or 96,probe=batch or 16),
                 tile=dict(m=128,n=96,stages=1,threads=128),io="fp16",accumulation=dict(qk="fp16",pv="fp16"))
             if static:
-                item.update(fixed_batch=batch,target="sm120",tensor_abi="pointer_only",qkv_layout="packed",qkv_stride=1152,output_stride=384)
+                item.update(fixed_batch=batch,target="sm120",tensor_abi="pointer_only",qkv_layout="packed",
+                    qkv_stride=3*heads*32,output_stride=heads*32)
             item["artifacts"] = {suffix:{"sha256":digest(directory/(prefix+suffix))} for suffix in (".o",".h","_api.h","_bridge.cpp")}
             (directory/(prefix+".json")).write_text(json.dumps(item))
     if static:
-        write_bundle(root)
+        write_bundle(root,label,heads,32,361)
 
 
 class ArtifactTests(unittest.TestCase):
@@ -80,12 +82,12 @@ class ArtifactTests(unittest.TestCase):
         self.root = self.directory/"bundle"
         make_fixture(self.root)
 
-    def run_cmake(self, root=None, ok=True, static=True):
+    def run_cmake(self, root=None, ok=True, static=True, label="b11", heads=12):
         root = root or self.root
         script = self.directory/"validate.cmake"
         script.write_text(f'''cmake_minimum_required(VERSION 3.19)
 include("{(HERE/'artifacts.cmake').as_posix()}")
-b11_fa4_collect_artifacts("{root.as_posix()}" sources dirs is_static)
+b11_fa4_collect_artifacts("{root.as_posix()}" sources dirs is_static {label} {heads} 32 361)
 list(LENGTH sources count)
 if(NOT count EQUAL {8 if static else 4} OR NOT "${{is_static}}" STREQUAL "{'TRUE' if static else 'FALSE'}")
   message(FATAL_ERROR "unexpected collection result")
@@ -118,6 +120,17 @@ endif()
         dynamic = self.directory/"dynamic"
         make_fixture(dynamic,False)
         self.run_cmake(dynamic,static=False)
+
+    def test_valid_b15_bundle(self):
+        # The b15 geometry must collect cleanly under its own label and row width.
+        b15 = self.directory/"b15bundle"
+        make_fixture(b15,True,"b15",16)
+        self.run_cmake(b15,label="b15",heads=16)
+
+    def test_geometry_label_mismatch(self):
+        # The same b11 artifacts must fail closed when collected as the b15
+        # geometry, so a mis-wired CMake variable cannot silently accept them.
+        self.run_cmake(ok=False,label="b15",heads=16)
 
     def test_tampered_object(self):
         path = next((self.root/"b13/exact").glob("*.o"))
@@ -164,7 +177,8 @@ endif()
     def test_static_abi_and_hot_guard(self):
         for batch in (13,16):
             for mode in ("exact","mask"):
-                args = SimpleNamespace(symbol_prefix="test",mode=mode,max_batch=batch,fixed_batch=batch)
+                args = SimpleNamespace(symbol_prefix="test",mode=mode,max_batch=batch,fixed_batch=batch,
+                    heads=12,head_dim=32,sequence=361)
                 api,bridge = render_bridge(args)
                 verify_static_abi(fixture_header("test",mode),"test",mode=="mask")
                 with self.assertRaises(ValueError):
@@ -202,25 +216,29 @@ template<class M,class R> struct CurrentDeviceLoader {
     sources = []
     stubs = ['#include "cuda_runtime_api.h"\nint test_prepare_calls=0; cudaError_t test_prepare_error=cudaSuccess; int test_calls=0;\n']
     checks = []
-    for batch in (13,16):
-        for mode in ("exact","mask"):
-            prefix = f"b11_fa4_static_b{batch}_{mode}_m128_n96_s1"
-            api,bridge = render_bridge(SimpleNamespace(symbol_prefix=prefix,mode=mode,max_batch=batch,fixed_batch=batch))
-            (directory/(prefix+".h")).write_text(fixture_header(prefix,mode))
-            (directory/(prefix+"_api.h")).write_text(api)
-            path = directory/(prefix+"_bridge.cpp")
-            path.write_text(bridge)
-            sources.append(path)
-            names = ("mQ","mK","mV","mO","mMask") if mode=="mask" else ("mQ","mK","mV","mO")
-            args = ",".join(f"{prefix}_Tensor_{name}_t*" for name in names)
-            stubs.append(f'''#include "{prefix}.h"
+    # Both shape-specialized geometries are compiled in, so the dispatcher table
+    # must expose both packed-QKV rows and neither may shadow the other.
+    for label,heads in (("b11",12),("b15",16)):
+        for batch in (13,16):
+            for mode in ("exact","mask"):
+                prefix = f"{label}_fa4_static_b{batch}_{mode}_m128_n96_s1"
+                api,bridge = render_bridge(SimpleNamespace(symbol_prefix=prefix,mode=mode,max_batch=batch,
+                    fixed_batch=batch,heads=heads,head_dim=32,sequence=361))
+                (directory/(prefix+".h")).write_text(fixture_header(prefix,mode))
+                (directory/(prefix+"_api.h")).write_text(api)
+                bridge_path = directory/(prefix+"_bridge.cpp")
+                bridge_path.write_text(bridge)
+                sources.append(bridge_path)
+                names = ("mQ","mK","mV","mO","mMask") if mode=="mask" else ("mQ","mK","mV","mO")
+                args = ",".join(f"{prefix}_Tensor_{name}_t*" for name in names)
+                stubs.append(f'''#include "{prefix}.h"
 #include "{prefix}_api.h"
 extern "C" void _mlir_{prefix}_cuda_init(void**){{}}
 extern "C" void _mlir_{prefix}_cuda_load_to_device(void**){{}}
 extern "C" int32_t cute_dsl_{prefix}_wrapper({prefix}_Kernel_Module_t*,{args},float,cudaStream_t){{++test_calls;return 0;}}
 ''')
-            mask = "p" if mode=="mask" else "nullptr"
-            checks.append(f'''  check({prefix}_launch(p,p,p,p,{mask},{batch},1,true,nullptr)==cudaSuccess);
+                mask = "p" if mode=="mask" else "nullptr"
+                checks.append(f'''  check({prefix}_launch(p,p,p,p,{mask},{batch},1,true,nullptr)==cudaSuccess);
   for(int b=-1;b<=97;++b) if(b!={batch}) check({prefix}_launch(p,p,p,p,{mask},b,1,true,nullptr)==cudaErrorInvalidValue);
   check({prefix}_launch(p,p,p,p,{mask},{batch},1,false,nullptr)==cudaErrorInvalidValue);
   check({prefix}_launch(p,p,p,p,{'nullptr' if mode=='mask' else 'p'},{batch},1,true,nullptr)==cudaErrorInvalidValue);
@@ -233,12 +251,20 @@ extern "C" int32_t cute_dsl_{prefix}_wrapper({prefix}_Kernel_Module_t*,{args},fl
     test = directory/"test.cpp"
     test.write_text("".join(stubs)+'''#include "b11_fa4_exact_m128_n96_s1_api.h"
 #include "b11_fa4_mask_m128_n96_s1_api.h"
+#include "b15_fa4_exact_m128_n96_s1_api.h"
+#include "b15_fa4_mask_m128_n96_s1_api.h"
 #include "static_fa4_profile.h"
+#include "static_fa4_dispatch.h"
 #include <cstdlib>
 void check(bool x){if(!x)std::exit(2);}
 int main(){void* p=reinterpret_cast<void*>(0x10000);void* bad=reinterpret_cast<void*>(0x10001);
 '''+"".join(checks)+'''
-  check(test_calls==4);
+  check(test_calls==8);
+  // The geometry-dispatch table must resolve exactly the compiled-in row widths.
+  check(b11aot::hasStaticFa4For(1152));check(b11aot::hasStaticFa4For(1536));
+  check(!b11aot::hasStaticFa4For(1024));check(!b11aot::hasStaticFa4For(384));
+  check(b11aot::staticFa4GeometryCompiled(1152)&&b11aot::staticFa4GeometryCompiled(1536));
+  check(!b11aot::staticFa4GeometryCompiled(768));
   for(int b=-1;b<=97;++b){
     bool supported=b==13||b==16;
     check(b11aot::supportsStaticFa4(b,true)==supported);
@@ -246,26 +272,34 @@ int main(){void* p=reinterpret_cast<void*>(0x10000);void* bad=reinterpret_cast<v
     check(b11_fa4_exact_m128_n96_s1_launch(p,p,p,p,nullptr,b,1,true,nullptr)==(supported?cudaSuccess:cudaErrorInvalidValue));
     check(b11_fa4_mask_m128_n96_s1_launch(p,p,p,p,p,b,1,true,nullptr)==(supported?cudaSuccess:cudaErrorInvalidValue));
     check(b11_fa4_exact_m128_n96_s1_launch(p,p,p,p,nullptr,b,1,false,nullptr)==cudaErrorInvalidValue);
+    check(b15_fa4_exact_m128_n96_s1_launch(p,p,p,p,nullptr,b,1,true,nullptr)==(supported?cudaSuccess:cudaErrorInvalidValue));
+    check(b15_fa4_mask_m128_n96_s1_launch(p,p,p,p,p,b,1,true,nullptr)==(supported?cudaSuccess:cudaErrorInvalidValue));
+    check(b15_fa4_exact_m128_n96_s1_launch(p,p,p,p,nullptr,b,1,false,nullptr)==cudaErrorInvalidValue);
   }
-  check(test_calls==8);
+  check(test_calls==16);
   check(b11_fa4_exact_m128_n96_s1_prepare()==cudaSuccess);check(test_prepare_calls==2);
   check(b11_fa4_mask_m128_n96_s1_prepare()==cudaSuccess);check(test_prepare_calls==4);
+  check(b15_fa4_exact_m128_n96_s1_prepare()==cudaSuccess);check(test_prepare_calls==6);
+  check(b15_fa4_mask_m128_n96_s1_prepare()==cudaSuccess);check(test_prepare_calls==8);
   test_prepare_error=cudaErrorUnknown;
-  check(b11_fa4_exact_m128_n96_s1_prepare()==cudaErrorUnknown);check(test_prepare_calls==5);
+  check(b11_fa4_exact_m128_n96_s1_prepare()==cudaErrorUnknown);check(test_prepare_calls==9);
   return 0;
 }
 ''')
     sources += [HERE/"static_fa4_dispatch.cpp",test]
     exe = directory/("test.exe" if sys.platform=="win32" else "test")
+    # static_fa4_dispatch.cpp only defines a geometry's symbols when that
+    # geometry's static bundle is compiled in, so both defines are required.
+    defines = ["USE_B11_STATIC_FA4","USE_B15_STATIC_FA4"]
     if Path(cxx).stem.lower()=="cl":
-        command = [cxx,"/nologo","/std:c++17","/EHsc",f"/I{directory}",f"/I{HERE}",f"/Fe{exe}"]+[str(p) for p in sources]
+        command = [cxx,"/nologo","/std:c++17","/EHsc"]+[f"/D{d}" for d in defines]+[f"/I{directory}",f"/I{HERE}",f"/Fe{exe}"]+[str(p) for p in sources]
     else:
-        command = [cxx,"-std=c++17","-I",str(directory),"-I",str(HERE),"-o",str(exe)]+[str(p) for p in sources]
+        command = [cxx,"-std=c++17"]+[f"-D{d}" for d in defines]+["-I",str(directory),"-I",str(HERE),"-o",str(exe)]+[str(p) for p in sources]
     result = subprocess.run(command,cwd=directory,capture_output=True,text=True)
     if result.returncode:
         raise RuntimeError("fake runtime compile failed\n"+result.stdout+result.stderr)
     subprocess.run([str(exe)],cwd=directory,check=True)
-    print("PASS: actual C++ static bridges/dispatcher, B=-1..97, packedness, mask/null/alignment and prepare-error propagation")
+    print("PASS: actual C++ static bridges and two-geometry dispatcher, B=-1..97, packedness, mask/null/alignment and prepare-error propagation")
 
 
 if __name__=="__main__":
